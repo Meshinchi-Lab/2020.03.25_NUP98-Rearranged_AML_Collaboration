@@ -1,0 +1,609 @@
+---
+title: "Clinical Characteristics of NUP98-Rearranged AML"
+author: "Jenny Smith"
+date: "March 25, 2020"
+output: html_document
+---
+
+#Set-up 
+
+```{r setup}
+library(knitr)
+clinical <- substr(CDE,1,nchar(CDE)-4)
+# dir.create(file.path(clinical,"analysis","2020.03.25_NUP98-Rearranged_AML_Collaboration"))
+knitr::opts_knit$set(root.dir = file.path(clinical,"analysis","2020.03.25_NUP98-Rearranged_AML_Collaboration"))
+
+
+knitr::opts_chunk$set(tidy.opts=list(width.cutoff=50),tidy=TRUE, fig.align='center')
+options(stringsAsFactors = FALSE)
+```
+
+```{r message = FALSE, warning=FALSE}
+library(stringr)
+library(magrittr)
+library(ggplot2)
+library(tidyr)
+library(dplyr)
+library(RColorBrewer)
+getwd()
+```
+
+```{r}
+source(file.path(SCRIPTS,"survival_analysis/Survplot_Functions_2018.10.24.r"))
+```
+
+#Define Functions 
+
+```{r}
+subset_summarize_breakpoints <- function(fusions_df, FOIs, filename="breakpoints_table.xlsx"){
+  
+  dataframes <- list()
+  for(FOI in FOIs){
+  
+  genes <- str_split_fixed(FOI, pattern = "-", n=2) #paste0(genes,"\\b")
+  regex <- paste(paste(genes[,1], genes[,2], sep="-"), 
+                 paste(genes[,2], genes[,1], sep="-"), sep="|")
+    
+  df <- fusions_df %>% 
+    filter(grepl(regex, Fusion.Category)) %>% 
+    select(Patient,SJ_ID, Fusion.Category,
+           breakpoint_comparison,
+           breakpoint.TA, Breakpoints.STAR, 
+           Breakpoint.CICERO,
+        matches("Alternate.Breakpoints"),
+        Num_FusionCaller_Hits, 
+        matches("Reads?|breakpoint_pairs")) %>% 
+  
+        select(-matches("TargAlign$|^sum\\."))%>%
+        arrange(breakpoint_comparison, Patient) 
+  
+  #Clean and make into the long format for breakpoints
+  brkpts <- df %>% 
+        separate(Alternate.Breakpoints.TA,
+                 into=paste0("Alternate.Breakpoints",1:100, ".TA"),
+                 sep="; ",
+                 remove=TRUE) %>%
+        separate(Alternate.Breakpoints.STAR,
+                 into=paste0("Alternate.Breakpoints",1:100, ".STAR"),
+                 sep="; ",
+                 remove=TRUE) %>%
+        separate(Alternate.Breakpoints.CICERO,
+                 into=paste0("Alternate.Breakpoints",1:100, ".CICERO"),
+                 sep="; ",
+                 remove=TRUE) %>%
+        select_if(~!all(is.na(.))) %>%
+        
+        rowwise() %>%
+        mutate_at(vars(matches("^[bB]reakpoints?\\.[A-Z]|^Alternate.Breakpoints[0-9]")),
+                  ~sort(str_split(., pattern = "\\|")[[1]]) %>% #sort the breakpoints
+                    paste(., collapse = "|")) %>%
+        ungroup() %>%
+
+        #Create long format
+        gather(Caller, Breakpoint,
+               matches("^[bB]reakpoints?\\.[A-Z]|^Alternate.Breakpoints[0-9]")) %>%
+        filter(Breakpoint != "") %>%
+        mutate_at(vars(Caller), ~gsub("^b","B", 
+                                      gsub("Alternate.Breakpoints[0-9]{,1}",
+                                                     "Alternate_Breakpoints", .))) %>%
+        mutate_at(vars(Caller), ~gsub("s$","", 
+                                      gsub("^Breakpoints?",
+                                           "Primary_Breakpoint", .))) %>%
+        separate(Caller, into=c("Breakpoint_Type", "Algorithm"), sep="\\.") %>%
+        arrange(Patient, breakpoint_comparison)
+  
+     #summary by fusion breakpoin type 
+    brkpts.summary <- brkpts %>% 
+        group_by(Patient, Breakpoint_Type) %>% 
+        filter(!duplicated(Breakpoint)) %>%
+        ungroup() %>%
+      
+        #for this purpose, I've been using the primary breakpoints 
+        filter(Breakpoint_Type=="Primary_Breakpoint") %>% 
+        
+        group_by(Fusion.Category,Breakpoint_Type, Breakpoint) %>%
+        summarize(Number_Breakpoint_Called=n()) %>%
+        ungroup() %>% 
+        
+        arrange(desc(Breakpoint_Type),desc(Number_Breakpoint_Called))
+
+    
+    sheetName <- paste0(FOI,"_Breakpt_Summary")
+    dataframes[[sheetName]] <- brkpts.summary 
+  }
+  openxlsx::write.xlsx(dataframes, file= filename)
+  message("Completed and save Breakpoint Tables")
+}
+```
+
+
+
+#Read in the clinical Data
+
+```{r}
+merged <- read.csv(file.path(CDE,"Merged/TARGET_AML_0531_1031_merged_CDEs_7.08.20.csv"),
+                   na.strings = c("N/A","#N/A","NA","^$", "^\\.$"))
+
+dim(merged)
+```
+
+```{r}
+CDEs <- merged %>% 
+  filter(!is.na(Reg.)) %>%
+  # filter(ScreenedForFusion == "Yes") %>%
+  
+  mutate(CNS.Disease.Harmonized=case_when(
+    grepl("CNS[12]", CNS.disease.at.on.study) ~ "No",
+    grepl("CNS3", CNS.disease.at.on.study) ~ "Yes",
+    grepl("Yes|No", CNS.disease) ~ CNS.disease,
+    TRUE ~ "Unknown")) %>% 
+  
+  
+  mutate(NUP98.Rearranged=case_when(
+    grepl("NUP98",Primary.Fusion.CNV) ~ Primary.Fusion.CNV,
+    grepl("NUP98", Additional.Fusions.CNV) ~ Additional.Fusions.CNV,
+    TRUE ~ "OtherAML"), 
+    ISCN=enc2utf8(ISCN),
+    Monosomy13_Del13q=case_when(
+      grepl("\\-13|del\\(13",ISCN) ~ "Yes", 
+      !grepl("Unknown", ISCN) & !is.na(ISCN) ~ "No",
+      TRUE ~ "Unknown")) %>% 
+  
+  #decided to not separate out the NUP-HOXES, etc. 
+  group_by(NUP98.Rearranged) %>% 
+  mutate(NUP98.Rearranged.Groups=ifelse(n() < 10, "NUP98-X", NUP98.Rearranged)) %>%
+  ungroup() %>% 
+  
+  mutate_at(vars(MLL),~case_when(
+    (grepl("KMT2A", Primary.Fusion.CNV) | grepl("KMT2A", Additional.Fusions.CNV)) & 
+      . != "MLL" ~ "Yes",
+      TRUE ~ . )) %>%
+  mutate_at(vars(t.8.21.),~case_when(
+      (grepl("RUNX1-RUNX1T1", Primary.Fusion.CNV) | grepl("RUNX1-RUNX1T1", Additional.Fusions.CNV)) & 
+      . != "t.8.21." ~ "Yes",
+      TRUE ~ . )) %>% 
+  mutate_at(vars(inv.16.),~case_when(
+     (grepl("CBFB-MYH11", Primary.Fusion.CNV) | grepl("CBFB-MYH11", Additional.Fusions.CNV)) & 
+      . != "inv.16." ~ "Yes",
+     TRUE ~ . )) 
+
+   
+
+
+dim(CDEs) #2189  143
+```
+
+```{r}
+any(CDEs$Protocol == "Unknown")
+sum(CDEs$ISCN == "Unknown")
+sum(is.na(CDEs$ISCN))
+```
+
+```{r}
+table(CDEs$CNS.disease.at.on.study) #1031 only 
+table(CDEs$CNS.disease) #0531 only
+table(CDEs$CNS.Disease.Harmonized)
+```
+
+```{r}
+table(CDEs$SCT.in.1st.CR, CDEs$Protocol, useNA = 'ifany')
+table(CDEs$Monosomy13_Del13q)
+```
+
+```{r}
+#Extremely different...
+sapply(merged[,c("MLL","t.8.21.","inv.16.")], table, useNA='ifany')
+sapply(CDEs[,c("MLL","t.8.21.","inv.16.")], table, useNA='ifany')
+```
+
+Need to address that 130 patients have unknown Protocol information. though they have Reg #s?? These are the same patients that mainly cause the discrepancies between the MLL column and Primary.Fusion.CNV since they are RNA-seq data
+--> 7/10/20 Rhonda looked these up in the biobank database and now have some limited information on them.
+
+
+```{r}
+#Updated! 
+filter(merged,grepl("PAXYGD", USI)) %>% 
+  select(USI,ISCN,Age.in.years,Primary.Fusion.CNV, Additional.Fusions.CNV)
+```
+
+```{r}
+sum(is.na(CDEs$Primary.Fusion.CNV))
+sum(CDEs$Primary.Fusion.CNV=="Unknown")
+sum(CDEs$Primary.Fusion.CNV=="")
+# View(merged$Primary.Fusion.CNV)
+table(CDEs$NUP98.Rearranged.Groups, useNA = 'ifany')
+```
+
+```{r}
+#Check on mono13/del13 ISCN strings manually
+# grep("\\-13|del\\(13", enc2utf8(merged$ISCN), value=TRUE)
+del13_check <- filter(CDEs, Monosomy13_Del13q == "Yes") %>% 
+  select(Reg., USI,Protocol, Age.in.years, ISCN, NUP98.Rearranged)
+
+
+head(del13_check)
+dim(del13_check)
+
+# write.csv(del13_check, "TARGET_AML_Mono13_Del13q_ISCNs.csv", row.names = FALSE)
+```
+
+
+#Sequencing Data Manifest
+
+```{r}
+sample_info <- read.csv(file.path(TARGET,
+                            "SequencingDataMatrix/TARGET_AML_Ribodepleted_Master_Manifest_5.29.20.csv"))
+
+toInclude <- setdiff(colnames(sample_info), colnames(CDEs)) %>% 
+  .[c(1:5,10)]
+
+sample_info <- sample_info %>% 
+  dplyr::select(USI,Group,  all_of(toInclude)) %>% 
+  left_join(., select(CDEs,
+                      USI,ISCN,Protocol,
+                      matches("^NUP98"), 
+                      Primary.Fusion.CNV, Additional.Fusions.CNV), 
+            by="USI")
+
+
+dim(sample_info) #2345   14
+head(sample_info)
+
+table(sample_info$NUP98.Rearranged.Groups, useNA = 'ifany')
+```
+
+```{r}
+filter(sample_info, is.na(NUP98.Rearranged.Groups)) %>% 
+  group_by(Group) %>% 
+  summarise(N=n())
+```
+
+#Read in the fusion data 
+
+```{r eval=FALSE}
+fusions <- read.csv(file.path(PROJHOME,"2018.09.11_Combine_Fusion_Calls/Combined_withConfidence_Intervals/TARGET_AML_0531_1031_Relapse_Combined_STAR_TransAbyss_CICERO_FusionCalls_withConfidenceLevels_Annotated_6.17.2020.csv"))
+
+dim(fusions)
+```
+
+
+#Define Samples and Fusion Breakpoints
+
+```{r}
+#removing TARGET.20.PAXLWH.CD34NEG.01R and other associated experimenal samples
+samps_NUP98 <- filter(sample_info,
+                grepl("NUP98", NUP98.Rearranged.Groups),
+                !grepl("FlowSorted",Group),
+                !grepl("replicate", Sample, ignore.case = T),
+                !grepl("relapse", Time_point, ignore.case = T), # dont include relapses here
+                !grepl("TARGET.20.PAXLWH\\.[A-Z]",Sample))
+
+table(samps_NUP98$NUP98.Rearranged.Groups)
+# NUP98-KDM5A  NUP98-NSD1     NUP98-X 
+#          32         104          21 
+
+length(unique(samps_NUP98$Sample))
+dim(samps_NUP98)
+```
+
+
+###Check which have RNA-seq 
+
+```{r}
+fusions.NUP <- fusions %>% 
+  filter(Time_point == "diagnostic") %>%
+  filter(grepl("NUP98",Fusion.Category)) %>%
+  select(-Protocol) %>%
+  full_join(., select(CDEs, USI, Reg.,Protocol,
+                      matches("^NUP98"), Cyto.vs..Seq,
+                      Primary.Fusion.CNV, Additional.Fusions.CNV) %>% 
+              filter(grepl("NUP98", NUP98.Rearranged)), 
+            by=c("USI")) %>%
+  arrange(desc(NUP98.Rearranged.Groups)) %>%
+  select(USI,Patient,SJ_ID,Reg., Protocol, ISCN,
+         NUP98.Rearranged.Groups, NUP98.Rearranged, 
+         Cyto.vs..Seq,
+         Primary.Fusion.CNV, Additional.Fusions.CNV,
+         breakpoint_comparison,
+         Fusion.Category, Type:Alternate.Breakpoints.CICERO) 
+
+dim(fusions.NUP)
+length(unique(fusions.NUP$Patient)) #191??
+```
+
+From CDEs 
+NUP98-KDM5A  NUP98-NSD1     NUP98-X    OtherAML 
+         34         110          23        2231 
+         
+         
+```{r}
+No.RBD.Avail <- fusions.NUP %>% 
+  filter(is.na(Fusion.Category))
+
+dim(No.RBD.Avail) #11 patients without the RBD RNAseq data
+# View(No.RBD.Avail) #remove NUP98-X TARGET.20.PAWMLN.03A.01R
+
+table(No.RBD.Avail$NUP98.Rearranged.Groups, useNA='ifany') #3 NUP98-X, 6 NUP98-NSD1, and 2 NUP98-KDM5A
+```
+OK,so even though I'd like to remove all 11 samples for consistency, at this point, the really scrutinized group will be the NUP98-X since they are far less common and are very novel. Also, the NSD1 and KDM5A (definitely KDM5A) were validated by qPCR. 
+
+Thus, remove these 3 NUP98-X only becuase we have strong RNA-seq evidence +  Karyo and can show to reviewers. remove NUP98-TOP1 bc No RNA-seq available anywhere, and run STAR on PANYSN to double check. #This PANYSN will be removed... STAR-fusion is simply choking on the SRA fastqs and theres no time to figure out why exacly this is happening. Remove NUP98-X since no RNA-seq evidence at all, despite RBD avialable.. 
+
+```{r}
+table(No.RBD.Avail$NUP98.Rearranged.Groups, No.RBD.Avail$Cyto.vs..Seq)
+```
+
+```{r}
+# grep("PASDKZ|PASNKZ|PAKERZ", fusions$USI, value=T)
+```
+
+
+### Check NUP98 Manually
+
+```{r}
+all.fusions.NUP.X <- fusions %>% 
+  filter(Time_point == "diagnostic") %>%
+  filter(grepl("NUP98",Fusion.Category), !grepl("KDM5A|NSD1", Fusion.Category)) %>%
+  left_join(., select(CDEs, USI,
+                      matches("^NUP98"), 
+                      Primary.Fusion.CNV, Additional.Fusions.CNV), 
+            by=c("USI")) %>%
+  arrange(desc(NUP98.Rearranged.Groups)) %>%
+  select(Patient,SJ_ID, Protocol, ISCN,
+         NUP98.Rearranged.Groups, NUP98.Rearranged, 
+         Primary.Fusion.CNV, Additional.Fusions.CNV,
+         breakpoint_comparison,
+         Fusion.Category, Type:Alternate.Breakpoints.CICERO) 
+
+dim(all.fusions.NUP.X) #73 26
+# View(all.fusions.NUP.X)
+# write.csv(all.fusions.NUP.X,"TARGET_AML_NUP98.X_RNAseq_check.csv", row.names = FALSE)
+```
+
+
+#Clean up Patients without RNA-seq evidence
+
+```{r}
+#Need to validate: PANYSN	752954	AAML03P1	NUP98-NAPEPLD.
+#This PANYSN will be removed... STAR-fusion is simply choking on the SRA fastqs and theres no time to figure out why exacly this is happening. 
+
+CDE_forAnalysis <- CDEs %>% 
+  filter(!grepl("861799", Reg.), #remove NUP98-TOP1
+         !grepl("PANYSN", USI)) %>% #remove NUP98-NAPELD because they are real by karyo but no RNA-seq. 
+  mutate_at(vars(NUP98.Rearranged.Groups, NUP98.Rearranged), 
+            ~case_when(USI == "PAWMLN" ~ "OtherAML", #no evidence of NUP98-rearranged at all
+                       TRUE ~ .))  %>% 
+  mutate_at(vars(Primary.Fusion.CNV), 
+            ~case_when(USI == "PAWMLN" ~ "None", 
+                       TRUE ~ .)) 
+   
+
+dim(CDE_forAnalysis) #2396  143
+
+table(CDE_forAnalysis$NUP98.Rearranged, useNA='ifany')
+table(CDE_forAnalysis$NUP98.Rearranged.Groups, useNA='ifany')
+
+
+rm(CDEs) #not needed 
+# write.csv(CDE_forAnalysis, "TARGET_AML_NUP98.rearranged_Cleaned_CDEs_7.15.2020.csv", row.names = FALSE)
+```
+
+```{r}
+NUP.X.Parters <- filter(CDE_forAnalysis, NUP98.Rearranged.Groups == "NUP98-X") %>% 
+  pull(NUP98.Rearranged) %>% 
+  str_split_fixed(., patter="-", n=2)
+
+length(unique(NUP.X.Parters[,2]))
+unique(NUP.X.Parters[,2])
+
+table(grepl("HOX", unique(NUP.X.Parters[,2])))
+```
+
+
+```{r fig.width=12}
+df <- CDE_forAnalysis %>% filter(NUP98.Rearranged.Groups=="NUP98-X")  %>% 
+  group_by(NUP98.Rearranged) %>% 
+  summarize(N=n()) %>% 
+  arrange(desc(N)) %>% 
+  mutate(NUP98.Rearranged=factor(NUP98.Rearranged, levels=unique(NUP98.Rearranged)), 
+         Homeobox=ifelse(grepl("HOX|PRRX1", NUP98.Rearranged), "Yes", "No"))
+ 
+# df
+colors_groups <- c(brewer.pal(n=9,"Set1"),brewer.pal(n=4,"Dark2")) %>% 
+  set_names(df$NUP98.Rearranged)
+# saveRDS(colors_groups,"TARGET_AML_NUP98.X_ColorCodes.RDS")
+
+
+# pdf("NUP98-X_Fusion_Partners.pdf", width=15, height=5)
+ggplot(data=df, aes(x=NUP98.Rearranged,y=N, fill=NUP98.Rearranged, color=Homeobox)) +
+  geom_bar(stat="identity", position = "dodge", size=2, width = 0.7) +
+  scale_fill_manual(values = colors_groups) +
+  scale_color_manual(values=c("grey90","black")) +
+  labs(y="Number of Samples", x="", title="NUP98-X: Heterogenous NUP98 Fusion Partners") +
+  theme_classic()+
+  theme(plot.title = element_text(size=20),
+        axis.title = element_text(size=20),
+        axis.text.y=element_text(size=18, color="black"),
+        axis.text.x = element_text(angle=35, size=18, hjust=1,vjust=1,
+                                   color="black"),
+        plot.margin = margin(l=2.5, unit="cm")) +
+  guides(fill=guide_legend(ncol=3, nrow=5))
+# dev.off()
+
+```
+
+```{r}
+CDE_forAnalysis %>% 
+  filter(NUP98.Rearranged.Groups=="NUP98-X") %>% 
+  mutate(HOX.NUP=ifelse(grepl("HOX", NUP98.Rearranged),"Yes","No"), 
+                        Total=n()) %>% 
+  select(USI, NUP98.Rearranged, HOX.NUP,Total) %>% 
+  arrange(desc(HOX.NUP)) %>%
+  group_by(HOX.NUP,Total) %>%
+  summarize(N=n()) %>%
+  mutate(Percent=N/Total*100)
+```
+
+```{r}
+CDE_forAnalysis %>% 
+  mutate(NUP98.Group=ifelse(grepl("NUP98", NUP98.Rearranged.Groups), "Yes", "No"),
+         Total=n()) %>% 
+  group_by(NUP98.Group,Total) %>% 
+  summarize(N=n()) %>%
+  mutate(Percent=N/Total*100)
+
+CDE_forAnalysis %>% 
+  mutate(Total=n()) %>% 
+  group_by(NUP98.Rearranged.Groups,Total) %>% 
+  summarize(N=n()) %>%
+  mutate(Percent=N/Total*100)
+```
+
+
+```{r}
+CDE_forAnalysis %>% 
+  # filter(NUP98.Rearranged.Groups)
+  group_by(NUP98.Rearranged.Groups) %>%
+  mutate(Total=n(),
+         median_age=median(Age.in.years, na.rm=TRUE)) %>% 
+  group_by(Age.Category,Total, add=TRUE) %>%
+  mutate(N=n()) %>%
+  mutate(Percent=N/Total*100) %>%
+  select(NUP98.Rearranged.Groups, Age.Category, median_age, N, Total, Percent) %>%
+  arrange(NUP98.Rearranged.Groups, desc(N)) %>% 
+  unique()
+```
+
+```{r}
+#For Todd and Rob
+forTodd <-  CDE_forAnalysis %>% 
+  mutate_at(vars(NUP98.Rearranged.Groups), 
+            ~gsub("OtherAML","AML_without_NUP98_rearrangement",.)) %>%
+  arrange(desc(NUP98.Rearranged.Groups)) %>%
+  mutate(NUP98.NSD1=ifelse(grepl("KDM5A|-X",NUP98.Rearranged.Groups),
+                           NA,NUP98.Rearranged.Groups),
+         NUP98.KDM5A=ifelse(grepl("NSD1|-X",NUP98.Rearranged.Groups),
+                            NA,NUP98.Rearranged.Groups),
+         NUP98.X=ifelse(grepl("NSD1|KDM5A",NUP98.Rearranged.Groups),
+                        NA,NUP98.Rearranged.Groups)) %>%
+  filter(!is.na(Reg.)) %>%
+  select(Reg.,USI,NUP98.Rearranged,NUP98.NSD1, NUP98.KDM5A, NUP98.X)
+  
+
+head(forTodd)
+dim(forTodd) #2396    6
+# View(forTodd)
+table(forTodd$NUP98.NSD1, useNA='ifany')
+table(forTodd$NUP98.KDM5A, useNA='ifany')
+table(forTodd$NUP98.X, useNA='ifany')
+
+# write.csv(forTodd,"TARGET_AML_NUP98-Rearranged_Regs_forOutcomeAnalysis_7.15.20.csv", row.names = FALSE)
+```
+
+```{r}
+rm(samps_NUP98)
+
+NUP98.sample_info <- sample_info %>% 
+  filter(!grepl("PANYSN", USI)) %>% #remove NUP98-NAPELD because they are real by karyo but no RNA-seq. The other NUP98-Top1 has no RNA-seq so not in manifest
+  mutate_at(vars(NUP98.Rearranged.Groups, NUP98.Rearranged), 
+            ~case_when(USI == "PAWMLN" ~ "OtherAML", #no evidence of NUP98-rearranged at all
+                       TRUE ~ .))  %>% 
+  mutate_at(vars(Primary.Fusion.CNV), 
+            ~case_when(USI == "PAWMLN" ~ "None", 
+                       TRUE ~ .))  %>%
+  filter((Group=="AML" | grepl("NBM|CD34_PB", Group)),
+        !grepl("FlowSorted",Group),
+        !grepl("replicate", Sample, ignore.case = T),
+        !grepl("TARGET.20.PAXLWH\\.[A-Z]",Sample)) %>%
+  
+  # Keep relapse for later
+  mutate_all(~ifelse(is.na(.), Group, .))
+ 
+
+dim(NUP98.sample_info)
+```
+
+```{r}
+table(NUP98.sample_info$NUP98.Rearranged, NUP98.sample_info$Time_point,
+      useNA='ifany')
+
+table(NUP98.sample_info$NUP98.Rearranged.Groups,
+      NUP98.sample_info$Time_point,
+      useNA='ifany')
+
+# write.csv(NUP98.sample_info, "TARGET_AML_NUP98.rearranged_Cleaned_RBD_Manifest_7.15.2020.csv", row.names = FALSE)
+```
+
+```{r}
+samps_NUP98 <- NUP98.sample_info %>% 
+  filter(grepl("NUP98", NUP98.Rearranged.Groups)) %>%
+  arrange(desc(NUP98.Rearranged.Groups), Group)
+
+dim(samps_NUP98) #156  14
+head(samps_NUP98)
+```
+
+
+
+#Breakpoints  Table
+
+```{r}
+category <- function(fusion_name){
+  
+  f <- str_split(fusion_name, pattern="-")[[1]]
+  f <- f[order(f)]
+  f <- paste(f, collapse = "-")
+  
+  return(f)
+}
+```
+
+```{r}
+tmp <- select(samps_NUP98, NUP98.Rearranged, Patient=Sample) %>%
+              rowwise() %>%
+              mutate(Fusion.Category=category(NUP98.Rearranged)) %>%
+              ungroup()
+
+length(unique(tmp$Fusion.Category))
+
+fusions_df <- filter(fusions, 
+                     Patient %in% samps_NUP98$Sample) %>% 
+  inner_join(.,tmp, by=c("Patient","Fusion.Category")) %>%
+  select(USI,Patient,SJ_ID, NUP98.Rearranged, All_Fusions_Called, Fusion.Category,
+         matches("^breakpoint|^Alternate.Breakpoints|Num_FusionCaller_Hits")) 
+
+dim(fusions_df)
+length(unique(fusions_df$Fusion.Category))
+```
+
+```{r}
+subset_summarize_breakpoints(fusions_df = fusions_df,
+                             FOIs=unique(fusions_df$Fusion.Category),
+                             filename="TARGET_AML_NUP98.Rearranged_Breakpoint_Summaries.xlsx")
+
+
+```
+
+
+
+
+#Session Info
+
+```{r}
+sessionInfo()
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

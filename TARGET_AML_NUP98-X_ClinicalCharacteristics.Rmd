@@ -1,0 +1,3442 @@
+---
+title: "Clinical Characteristics of NUP98-Rearranged AML"
+author: "Jenny Smith"
+date: "March 25, 2020"
+output: html_document
+---
+
+#Set-up 
+
+```{r setup}
+library(knitr)
+clinical <- substr(CDE,1,nchar(CDE)-4)
+# dir.create(file.path(clinical,"analysis","2020.03.25_NUP98-Rearranged_AML_Collaboration"))
+
+# local <- Sys.info()[["nodename"]] == "C02FC5BLMD6M"
+local <- FALSE
+knitr::opts_knit$set(root.dir = ifelse(local, "~/NUP98/", file.path(clinical,"analysis","2020.03.25_NUP98-Rearranged_AML_Collaboration")))
+
+
+knitr::opts_chunk$set(tidy.opts=list(width.cutoff=50),tidy=TRUE, fig.align='center')
+options(stringsAsFactors = FALSE)
+table = function (..., useNA = 'ifany') base::table(..., useNA = useNA)
+```
+
+```{r message = FALSE, warning=FALSE}
+library(stringr)
+library(magrittr)
+library(ggplot2)
+library(gridExtra)
+library(tidyr)
+library(dplyr)
+library(tibble)
+library(RColorBrewer)
+
+# getwd()
+```
+
+```{r}
+# source(file.path(SCRIPTS,"survival_analysis/Survplot_Functions_2018.10.24.r"))
+
+if(!local){
+source(file.path(SCRIPTS,"RNAseq_Analysis/DifferentialExpn_PathwayAnalysis/R/Survplot_Functions_2018.10.24.r"))
+}  
+
+```
+
+# Define Functions 
+
+```{r}
+get_locus <- function(in_band,type="start", cytobands){
+    df <- filter(cytobands, grepl(in_band, name))
+    
+    start <- pull(df,chromStart)
+    end <- pull(df, chromEnd)
+    
+    if(nrow(df) > 1){
+      start <- min(start)
+      end <- max(end)
+    }
+    
+    pos <- ifelse(type=="start", start, end)
+    return(pos)
+}
+```
+
+```{r}
+make_GRlist <- function(GRanges_object){
+  n <- length(GRanges_object)
+  GRlist <- GRangesList()
+  for(i in 1:n){
+    GRlist[[i]] <- GRanges_object[i]
+  }
+  return(GRlist)
+}
+```
+
+
+```{r}
+subset_summarize_breakpoints <- function(fusions_df, FOIs, filename="breakpoints_table.xlsx"){
+  
+  dataframes <- list()
+  for(FOI in FOIs){
+  
+  genes <- str_split_fixed(FOI, pattern = "-", n=2) #paste0(genes,"\\b")
+  regex <- paste(paste(genes[,1], genes[,2], sep="-"), 
+                 paste(genes[,2], genes[,1], sep="-"), sep="|")
+    
+  df <- fusions_df %>% 
+    filter(grepl(regex, Fusion.Category)) %>% 
+    select(Patient,SJ_ID, Fusion.Category,
+           breakpoint_comparison,
+           breakpoint.TA, Breakpoints.STAR, 
+           Breakpoint.CICERO,
+        matches("Alternate.Breakpoints"),
+        Num_FusionCaller_Hits, 
+        matches("Reads?|breakpoint_pairs")) %>% 
+  
+        select(-matches("TargAlign$|^sum\\."))%>%
+        arrange(breakpoint_comparison, Patient) 
+  
+  #Clean and make into the long format for breakpoints
+  brkpts <- df %>% 
+        separate(Alternate.Breakpoints.TA,
+                 into=paste0("Alternate.Breakpoints",1:100, ".TA"),
+                 sep="; ",
+                 remove=TRUE) %>%
+        separate(Alternate.Breakpoints.STAR,
+                 into=paste0("Alternate.Breakpoints",1:100, ".STAR"),
+                 sep="; ",
+                 remove=TRUE) %>%
+        separate(Alternate.Breakpoints.CICERO,
+                 into=paste0("Alternate.Breakpoints",1:100, ".CICERO"),
+                 sep="; ",
+                 remove=TRUE) %>%
+        select_if(~!all(is.na(.))) %>%
+        
+        rowwise() %>%
+        mutate_at(vars(matches("^[bB]reakpoints?\\.[A-Z]|^Alternate.Breakpoints[0-9]")),
+                  ~sort(str_split(., pattern = "\\|")[[1]]) %>% #sort the breakpoints
+                    paste(., collapse = "|")) %>%
+        ungroup() %>%
+
+        #Create long format
+        gather(Caller, Breakpoint,
+               matches("^[bB]reakpoints?\\.[A-Z]|^Alternate.Breakpoints[0-9]")) %>%
+        filter(Breakpoint != "") %>%
+        mutate_at(vars(Caller), ~gsub("^b","B", 
+                                      gsub("Alternate.Breakpoints[0-9]{,1}",
+                                                     "Alternate_Breakpoints", .))) %>%
+        mutate_at(vars(Caller), ~gsub("s$","", 
+                                      gsub("^Breakpoints?",
+                                           "Primary_Breakpoint", .))) %>%
+        separate(Caller, into=c("Breakpoint_Type", "Algorithm"), sep="\\.") %>%
+        arrange(Patient, breakpoint_comparison)
+  
+     #summary by fusion breakpoin type 
+    brkpts.summary <- brkpts %>% 
+        group_by(Patient, Breakpoint_Type) %>% 
+        filter(!duplicated(Breakpoint)) %>%
+        ungroup() %>%
+      
+        #for this purpose, I've been using the primary breakpoints 
+        filter(Breakpoint_Type=="Primary_Breakpoint") %>% 
+        
+        group_by(Fusion.Category,Breakpoint_Type, Breakpoint) %>%
+        summarize(Number_Breakpoint_Called=n()) %>%
+        ungroup() %>% 
+        
+        arrange(desc(Breakpoint_Type),desc(Number_Breakpoint_Called))
+
+    
+    sheetName <- paste0(FOI,"_Breakpt_Summary")
+    dataframes[[sheetName]] <- brkpts.summary 
+  }
+  openxlsx::write.xlsx(dataframes, file= filename)
+  message("Completed and save Breakpoint Tables")
+}
+```
+
+
+
+# Read in the clinical Data
+
+```{r}
+NUP98.cohort <- read.csv("TARGET_AML_NUP98.rearranged_Cleaned_Groups_REG_10.26.2020.csv") %>% 
+  mutate(Reg.=as.character(Reg.)) %>% 
+  select(-USI)
+
+
+dim(NUP98.cohort) #2304    4
+# head(NUP98.cohort)
+# table(NUP98.cohort$USI == "Unknown")
+
+# table(NUP98.cohort$NUP98.Rearranged.Groups)
+```
+
+```{r}
+nup.ineligable <- openxlsx::read.xlsx("COG/nup98x_notincohort.xlsx", sheet = 1) %>% 
+  filter(!Not_in == "") %>% 
+  arrange(Reg_NO)
+
+# head(nup.ineligable, n=10)
+dim(nup.ineligable) #69 patients
+table(nup.ineligable$reason)
+```
+
+```{r}
+#dont use this one for clinical chars since the paper was writen before the addition of RNAIndel dataset into the CDEs for additional WT1 mutations from WGS and COG.
+#teh WT1 mutations do not affect the NUP98-X cohort (no change in frequency)
+chr13 <- read.csv(file.path(CDE, "Merged/00_Old/TARGET_AML_0531_1031_merged_CDEs_05.01.21.csv"),
+                    na.strings = c("N/A","#N/A","NA","^$", "^\\.$")) %>% 
+  select(matches("Reg.|chr13|_13"))
+
+
+dim(chr13)
+# chr13
+```
+
+```{r}
+exon_juncs <- read.csv("TARGET_AML_NUP98_fusion_exons_3.20.21.csv") %>% 
+  filter(!grepl("replicate", Sample))
+
+dim(exon_juncs)
+# head(exon_juncs)
+```
+
+```{r}
+manifest <- read.csv("TARGET_AML_RNAseq_Cohort_for_Manuscript.csv")
+
+dim(manifest)
+```
+
+```{r}
+inelig <- read.csv(file.path(CDE, "Merged/TARGET_AML_0531_1031_merged_CDEs_05.21.21.csv")) %>% 
+  filter(Eligibility_Comments == "remove") %>% 
+  select(USI, Reg.)
+```
+
+```{r}
+merged <- read.csv(file.path(CDE, "Merged/TARGET_AML_0531_1031_merged_CDEs_05.21.21.csv"), 
+                    na.strings = c("N/A","#N/A","NA","^$", "^\\.$")) %>% 
+  left_join(., chr13, by="Reg.") %>% 
+  filter(Eligibility_Comments != "remove") %>% 
+
+  mutate(Reg.=as.character(Reg.)) %>%
+  inner_join(., NUP98.cohort,
+             by="Reg.") %>%  
+  left_join(., select(exon_juncs,-c(NUP98.Rearranged.Groups:NUP98.Rearranged), -Reg., -FIX),
+            by="USI") %>% 
+  mutate(CNS.Disease.Harmonized=case_when(
+    grepl("CNS[12]", CNS.disease.at.on.study) ~ "No",
+    grepl("CNS3", CNS.disease.at.on.study) ~ "Yes",
+    grepl("Yes|No", CNS.disease) ~ CNS.disease,
+    TRUE ~ "Unknown")) %>% 
+  
+  #For this analysis include <0.1 AR are FLT3-ITD positive 
+  mutate_at(vars(FLT3.ITD.positive.), ~gsub("<0.1", "Yes", .)) %>% 
+  mutate(Any_chr13_Abnormality=case_when(
+                  !is.na(deletion_chr13)  | !is.na(translocation_13) ~ "chr13_Abnormality", 
+                  grepl("monosomy13", monosomy_trisomy_13) ~ "chr13_Abnormality",
+                  ISCN=="Unknown" ~ "Unknown",
+                  TRUE ~ "None"), 
+         Any_chr13_Deletion=case_when(
+           !is.na(deletion_chr13) ~ "chr13_deletion",
+           ISCN=="Unknown" ~ "Unknown",
+           TRUE ~ "None"),
+         Any_chr13_CNV=case_when(
+           !is.na(deletion_chr13) | !is.na(monosomy_trisomy_13) ~ "chr13_CNV",
+           ISCN=="Unknown" ~ "Unknown",
+           TRUE ~ "None")) 
+
+
+
+head(merged)
+dim(merged) #2296  195
+
+# write.csv(merged, "~/NUP98/TARGET_AML_0531_1031_merged_CDEs_10.26.2021.csv")
+```
+
+```{r}
+CDE_forAnalysis <- merged %>% 
+  filter(Eligibility_Comments != "remove") %>% 
+  filter(!Reg. %in% nup.ineligable$Reg_NO)   #Arm D patients
+  
+
+dim(CDE_forAnalysis) #2235
+# table(CDE_forAnalysis$NUP98.Rearranged.Groups,
+#       CDE_forAnalysis$WT1.mutation.)
+# write.csv(CDE_forAnalysis, "~/NUP98/TARGET_AML_NUP98.rearranged_Cohort_10.26.21.csv")
+# write.csv(CDE_forAnalysis, file.path(PROJHOME,"2020.03.26_NUP98.Rearranged_Collab/TARGET_AML_NUP98.rearranged_Cohort_08.24.21.csv"), row.names = FALSE)
+# write.csv(select(CDE_forAnalysis,USI,Reg.,Protocol, NUP98.Rearranged.Groups,NUP98.Rearranged),
+
+table(CDE_forAnalysis$NUP98.Rearranged.Groups)
+# table(CDE_forAnalysis$Any_chr13_Abnormality, CDE_forAnalysis$NUP98.Rearranged.Groups)
+```
+
+
+```{r}
+forHematologics <- merged %>% 
+  filter(grepl("NUP98", Primary.Fusion)) %>% 
+  select(Reg., Protocol, FLT3.ITD.positive., NUP98.Rearranged.Groups) %>% 
+  arrange(desc(NUP98.Rearranged.Groups))
+
+# write.csv(forHematologics,"TARGET_AML_NUP98.Rearranged_10.6.2021.csv", row.names = FALSE)
+# table(forHematologics$NUP98.Rearranged.Groups)
+```
+  
+
+## DNA methylation data 
+
+```{r}
+dname_cohort <- openxlsx::read.xlsx("TARGET_AML_USIs_in_DNAme_analysis_Fig.3_T.Triche.xlsx")
+
+head(dname_cohort)
+```
+
+```{r}
+dname_cohort %>% 
+  filter(Timepoint=="NBM") %>% 
+  arrange(subject)
+```
+
+```{r}
+# table(dname_cohort$fusion)
+# table(dname_cohort$Timepoint)
+```
+
+
+## Differences between Clinical and RNAseq Data Availability
+
+```{r}
+diff_KDM5A <- exon_juncs %>% 
+  filter(NUP98.Rearranged.Groups=="NUP98-KDM5A") %>% 
+  select(USI, NUP98_Exon_Group,NUP98.Rearranged.Groups) %>% 
+  full_join(., filter(CDE_forAnalysis, NUP98.Rearranged.Groups=="NUP98-KDM5A") %>% 
+              select(USI, NUP98.Rearranged.Groups), 
+            by="USI")
+
+diff_KDM5A %>% 
+  filter(is.na(NUP98.Rearranged.Groups.x) | is.na(NUP98.Rearranged.Groups.y))
+```
+
+
+Data used for oncoprint 3/20/21
+                No Unknown  Yes (WT1 status)
+  NUP98-KDM5A   30       1    1
+  NUP98-NSD1    66       0   42 
+  NUP98-X       15       0    5
+  OtherAML    1800     128  147
+  
+WT1 updates in May 2021 - yes need to update
+                No Unknown  Yes (WT1 status)
+  NUP98-KDM5A   31       0    1
+  NUP98-NSD1    61       0   47 *added 5 WT1 to NSD1 but not enough to make a difference*
+  NUP98-X       15       0    5
+  OtherAML    1802      81  192 *added 45 of WT1 to the ref cohort*
+
+
+# Define Samples for Oncoprint
+
+```{r}
+dat <- CDE_forAnalysis %>% 
+  filter(grepl("NUP98", NUP98.Rearranged.Groups)) %>% 
+  mutate(FAB=case_when(
+    M7_AML == "Yes" ~ "M7",
+    M6_AML == "Yes" ~ "M6",
+    M7_AML=="Unknown" | M6_AML =="Unknown" ~ "Unknown",
+    TRUE ~ "Other FAB")) %>% 
+  select(Reg.,
+         Age.in.years,FAB, 
+         FLT3.ITD.positive.,WT1.mutation.:CEBPA.mutation.,
+         c.Kit.Mutation.Exon.8,c.Kit.Mutation.Exon.17,
+         CBL.Mutation, 
+         Any_chr13_Abnormality,
+         NUP98.Rearranged.Groups,
+         # Primary.Fusion,
+         Primary.CNV, Additional.Fusions.CNV, 
+         ISCN) %>% 
+
+
+  #Define updated columns 
+  # mutate(
+         # #Fusions
+         # KMT2Ar=ifelse(grepl("KMT2A",Primary.Fusion), "Yes","No"),
+         # RUNX1.RUNX1T1=ifelse(grepl("RUNX1-RUNX1T1",Primary.Fusion), "Yes","No"),
+         # CBFB.MYH11=ifelse(grepl("CBFB-MYH11",Primary.Fusion), "Yes","No"),
+         # CBFA2T3.GLIS2=ifelse(grepl("CBFA2T3-GLIS2",Primary.Fusion), "Yes","No"),
+         # RBM15.MKL1=ifelse(grepl("RBM15-MKL1",Primary.Fusion), "Yes","No")) %>% 
+  #CNVs 
+  mutate(Monosomy7=ifelse(grepl("monosomy7",Primary.CNV) | grepl("monosomy7",Additional.Fusions.CNV), "Yes","No"),
+         Del5q=ifelse(grepl("del5q",Primary.CNV) | grepl("del5q",Additional.Fusions.CNV), "Yes","No"),
+         Abnormality13=ifelse(Any_chr13_Abnormality=="None" | Any_chr13_Abnormality=="Unknown","No","Yes"),
+         Trisomy8=ifelse(grepl("trisomy8",Primary.CNV) | grepl("trisomy8",Additional.Fusions.CNV), "Yes","No"),
+         Trisomy21=ifelse(grepl("trisomy21",Primary.CNV) | grepl("trisomy21",Additional.Fusions.CNV), "Yes","No")) %>% 
+
+
+  #Clean up the mutation columns   
+  mutate(c.Kit.Mutation=case_when(
+    grepl("Yes", c.Kit.Mutation.Exon.8) | grepl("Yes", c.Kit.Mutation.Exon.17) ~ "Yes",
+    grepl("Unknown", c.Kit.Mutation.Exon.8) |  grepl("Unknown", c.Kit.Mutation.Exon.17) ~ "Unknown",
+    TRUE ~ "No")) %>% 
+  mutate_at(vars(CBL.Mutation), ~case_when(
+    .=="No" ~ .,
+    grepl("Del_", .) ~ "Yes"))  %>%
+  mutate_at(vars(FLT3.ITD.positive.:CBL.Mutation),
+            ~ifelse(is.na(.), "Unknown", .))  %>% 
+  
+  mutate(Age.Category=factor(case_when(
+      Age.in.years < 3 ~ "Less than 3 years",
+      Age.in.years >= 3 & Age.in.years < 10 ~ "Between 3 and 10 years",
+      Age.in.years >= 10 ~ "Greater than 10 years",
+    TRUE ~ "Unknown"), levels=c("Less than 3 years","Between 3 and 10 years",
+                                "Greater than 10 years","Unknown"))) %>% 
+  
+   mutate_at(vars(NUP98.Rearranged.Groups), ~factor(., levels=c("NUP98-NSD1",
+                                                               "NUP98-KDM5A",
+                                                               "NUP98-X"))) %>%
+
+  select(Reg.,
+         FAB, NUP98.Rearranged.Groups,
+         `Age Category`=Age.Category,
+         FLT3.ITD.positive.:CBL.Mutation,c.Kit.Mutation,
+         Monosomy7:Trisomy21,
+         Any_chr13_Abnormality,
+         c.Kit.Mutation.Exon.8:c.Kit.Mutation.Exon.17,
+         # KMT2Ar:RBM15.MKL1, 
+         ISCN,
+         -Primary.CNV,
+         -Age.in.years)
+
+
+# table(dat$Abnormality13)
+table(dat$Abnormality13,dat$NUP98.Rearranged.Groups)
+# table(dat$FAB)
+# head(dat)
+```
+
+
+# WT1 in NUP98-X compared to age 
+
+```{r}
+test_wt1_age <- merged %>% 
+  filter(NUP98.Rearranged.Groups=="NUP98-X") %>% 
+  select(USI, WT1.mutation., Age.in.years) %>% 
+  mutate(WT1.mutation.=factor(WT1.mutation., levels=c("No","Yes")))
+
+krus.res <- kruskal.test(Age.in.years ~ WT1.mutation., data=test_wt1_age)
+wilc.res <- wilcox.test(Age.in.years ~ WT1.mutation., data=test_wt1_age, alternative = c("two.sided"))
+
+round(krus.res$p.value, digits = 3)
+test_wt1_age %>%
+  group_by(WT1.mutation.) %>%
+  summarize(median_age=round(median(Age.in.years), digits = 1))
+```
+
+
+# Mutations Data Check with COG/Hematologics
+
+```{r}
+official <- openxlsx::read.xlsx(file.path(CDE, "Merged/00_Old/AAML1031_TARGET_format_033119_v10_121120_SENT_TO_COG.xlsx"),
+                                check.names = FALSE, sep.names = " ")
+
+head(official)
+dim(official) #1231  102
+
+# official$CSF3R
+
+# table(official$`FLT3/ITD positive?`)
+# table(CDEs$Protocol, CDEs$FLT3.ITD.positive.)
+
+# table( CDE_forAnalysis$NUP98.Rearranged.Groups, CDE_forAnalysis$M7_AML)
+# table(CDE_forAnalysis$NUP98.Rearranged.Groups, CDE_forAnalysis$M6_AML)
+# table(CDE_forAnalysis$NUP98.Rearranged.Groups, CDE_forAnalysis$FLT3.ITD.positive.)
+# table(CDE_forAnalysis$NUP98.Rearranged.Groups, CDE_forAnalysis$NPM.mutation.)
+```
+
+
+```{r}
+official %>% 
+  select(USI, `FLT3/ITD positive?`, del5q) %>% 
+  inner_join(., select(CDE_forAnalysis,USI, NUP98.Rearranged.Groups, FLT3.ITD.positive., del5q_new=del5q),
+             by="USI") %>% 
+  # filter(NUP98.Rearranged.Groups == "NUP98-NSD1") %>% 
+  # filter(del5q_new=="Yes")
+  group_by(NUP98.Rearranged.Groups,  `FLT3/ITD positive?`, FLT3.ITD.positive.) %>%
+  count()
+```
+
+* Perhaps include FLT3-ITD inconsistencies in the numbers! Its off by two patients from what COG reports 
+  - 1 additional FLT3-ITD+ pateint in NSD1, who was previously labeled at < 0.1 AR. 
+  - 1 additional ITD- patient is Unknown in our dataset. 
+
+
+
+
+### For COG 
+
+```{r}
+colname_map <- openxlsx::read.xlsx(file.path(CDE,"00_Archive/TARGET_AML_Colnames_Mapping_File_v3.xlsx"), sheet = 1) 
+
+# head(colname_map)
+# colname_map %>% 
+#   filter(grepl("KIT", Merged_CDEs_Colnames, ignore.case = T))
+```
+
+```{r}
+mismatched_cyto <- CDE_forAnalysis %>% 
+  filter(grepl("NUP98", NUP98.Rearranged.Groups)) %>% 
+  select(USI,NUP98.Rearranged.Groups, trisomy.8, trisomy.21, monosomy.7, del5q, ISCN, Primary.CNV, Additional.Fusions.CNV) %>% 
+  arrange(NUP98.Rearranged.Groups, desc(trisomy.8), desc(trisomy.21)) %>% 
+  mutate(Tri21_fix=c(grepl("trisomy21",Primary.CNV) | grepl("trisomy21",Additional.Fusions.CNV)) & trisomy.21=="No",
+         Tri8_fix=(grepl("trisomy8",Primary.CNV) | grepl("trisomy8",Additional.Fusions.CNV)) & trisomy.8=="No",
+         mono7_fix=(grepl("monosomy7",Primary.CNV) | grepl("monosomy7",Additional.Fusions.CNV)) & monosomy.7=="No",
+         del5q_fix=c(grepl("del5q",Primary.CNV) | grepl("del5q",Additional.Fusions.CNV)) & del5q=="No") %>% 
+  filter(Tri21_fix | Tri8_fix | mono7_fix | del5q_fix | (NUP98.Rearranged.Groups == "NUP98-NSD1" & del5q == "Yes")) %>% 
+  select(USI, NUP98.Rearranged.Groups, ISCN)
+
+
+# mismatched_cyto
+# write.csv(mismatched_cyto, "NUP98_Cyto_CNV_toUpdate_3.22.21.csv", row.names = F)
+```
+
+THE FAB DOESNT MATCH EITHER???
+ 
+```{r}
+cols <- c("Any_chr13_Abnormality",	"Any_chr13_Deletion",	"Any_chr13_CNV",	"deletion_chr13",	"monosomy_trisomy_13",	"translocation_13", "trisomy.8", "trisomy.21", "monosomy.7", "del5q", "M7_AML","M6_AML","NUP98_Exons")
+
+official_colnames <- colname_map %>% 
+  filter(Merged_CDEs_Colnames %in% colnames(dat) | 
+           Merged_CDEs_Colnames %in%  cols) %>% 
+  mutate_at(vars(AAML1031_Official_Colnames), ~case_when(
+    is.na(.) ~ gsub("_|\\."," ", Merged_CDEs_Colnames),
+    TRUE ~ .))
+  # filter(!is.na(AAML1031_Official_Colnames))
+
+#For Todd and Rob
+forTodd <-  CDE_forAnalysis %>% 
+  mutate_at(vars(NUP98.Rearranged.Groups), 
+            ~gsub("OtherAML","AML_without_NUP98_rearrangement",.)) %>%
+  arrange(desc(NUP98.Rearranged.Groups)) %>%
+  mutate(NUP98.NSD1=ifelse(grepl("KDM5A|-X",NUP98.Rearranged.Groups),
+                           NA,NUP98.Rearranged.Groups),
+         NUP98.KDM5A=ifelse(grepl("NSD1|-X",NUP98.Rearranged.Groups),
+                            NA,NUP98.Rearranged.Groups),
+         NUP98.X=ifelse(grepl("NSD1|KDM5A",NUP98.Rearranged.Groups),
+                        NA,NUP98.Rearranged.Groups)) %>%
+  filter(!is.na(Reg.)) %>%
+  left_join(., select(official, USI, del5q_old=del5q),
+            by="USI") %>% 
+  
+  #To Fix CNV vs binary columns 
+  rowwise() %>% 
+  mutate(Tri21_fix=!grepl("AML_without", NUP98.Rearranged.Groups) & 
+           c(grepl("trisomy21",Primary.CNV) | grepl("trisomy21",Additional.Fusions.CNV)) & trisomy.21=="No",
+         Tri8_fix=!grepl("AML_without", NUP98.Rearranged.Groups) &  
+           c(grepl("trisomy8",Primary.CNV) | grepl("trisomy8",Additional.Fusions.CNV)) & trisomy.8=="No",
+         mono7_fix=!grepl("AML_without", NUP98.Rearranged.Groups) & 
+           c(grepl("monosomy7",Primary.CNV) | grepl("monosomy7",Additional.Fusions.CNV)) & monosomy.7=="No",
+         del5q_fix=!grepl("AML_without", NUP98.Rearranged.Groups) &  
+           c(grepl("del5q",Primary.CNV) | grepl("del5q",Additional.Fusions.CNV)) & del5q=="No") %>% 
+  mutate(Updated_CNV=case_when(
+    any(Tri21_fix | Tri8_fix |  mono7_fix | del5q_fix) ~ "updated",
+    NUP98.Rearranged.Groups == "NUP98-NSD1" & del5q == "Yes" & del5q_old == "No" ~ "updated",
+   TRUE ~ "no change")) %>%
+  ungroup() %>% 
+  
+  mutate(trisomy.21=ifelse(Tri21_fix, "Yes", trisomy.21),
+         trisomy.8=ifelse(Tri8_fix, "Yes", trisomy.8),
+         monosomy.7=ifelse(mono7_fix, "Yes", monosomy.7),
+         del5q=ifelse(del5q_fix, "Yes", del5q)) %>% 
+
+  dplyr::select(Reg.,USI,
+                Updated_CNV,
+                NUP98.Rearranged,
+                NUP98.Rearranged.Groups,
+                NUP98.NSD1,
+                NUP98.KDM5A,
+                NUP98.X,
+                trisomy.21, 
+                trisomy.8, 
+                monosomy.7,
+                del5q,
+                one_of(colnames(dat)),
+                one_of(cols)) %>% 
+  rename_at(vars(official_colnames$Merged_CDEs_Colnames),
+            ~official_colnames$AAML1031_Official_Colnames)
+
+
+
+# dim(forTodd) #2235
+# View(forTodd)
+# table(forTodd$NUP98.NSD1, useNA='ifany')
+# table(forTodd$NUP98.KDM5A, useNA='ifany')
+# table(forTodd$NUP98.X, useNA='ifany')
+
+# write.csv(forTodd,"TARGET_AML_NUP98-Rearranged_Regs_forStats_5.25.21.csv", row.names = FALSE)
+# openxlsx::write.xlsx(select(forTodd,-USI), "TARGET_AML_NUP98-Rearranged_Regs_forStats_08.16.21.xlsx",keepNA=FALSE,row.names=FALSE)
+
+
+# table(forTodd$Updated_CNV, forTodd$NUP98.Rearranged.Groups)
+# table(forTodd$Any_chr13_Abnormality, forTodd$NUP98.Rearranged.Groups)
+# table(forTodd$NUP98_Exons, forTodd$NUP98.Rearranged.Groups)
+```
+
+```{r}
+forOnco.freqs <- sapply(dat[,2:17], table)
+
+forOnco.freqs$Trisomy8
+forOnco.freqs$Trisomy21
+forOnco.freqs$Del5q
+
+# table(dat$NUP98.Rearranged.Groups, dat$FAB)
+
+# forOnco.freqs$FLT3.ITD.positive.
+# forOnco.freqs$WT1.mutation.
+# forOnco.freqs$CEBPA.mutation.
+```
+
+```{r}
+forTodd.freqs <- sapply(forTodd[forTodd$NUP98.Rearranged.Groups != "AML_without_NUP98_rearrangement",c(5,9:14,17:20,22:23)], table)
+
+forTodd.freqs$`trisomy 8`
+forTodd.freqs$`trisomy 21`
+forTodd.freqs$del5q
+
+# forTodd.freqs$`M7 AML`
+# forTodd.freqs$`M6 AML`
+
+forTodd.freqs$`FLT3/ITD positive?`
+forTodd.freqs$`WT1 mutation?`
+forTodd.freqs$`CEBPA mutation?`
+```
+
+
+trisomy 8 - need to add additional +8 in NUP98-X
+del5q - need to add additional del5q in NUP98-NSD1
+
+
+--------
+samples removed: 
+Need to validate: PANYSN	752954	AAML03P1	NUP98-NAPEPLD.
+-->This PANYSN will be removed... STAR-fusion is simply choking on the SRA fastqs and theres no time to figure out why exacly this is happening. 
+
+CDE_forAnalysis <- CDEs %>% 
+  filter(!grepl("861799", Reg.), #remove NUP98-TOP1
+         !grepl("PANYSN", USI)) %>% #remove NUP98-NAPELD because they are real by karyo but no RNA-seq. 
+  mutate_at(vars(NUP98.Rearranged.Groups, NUP98.Rearranged), 
+            ~case_when(USI == "PAWMLN" ~ "OtherAML", #no evidence of NUP98-rearranged at all
+                       TRUE ~ .))  %>% 
+  mutate_at(vars(Primary.Fusion.CNV), 
+            ~case_when(USI == "PAWMLN" ~ "None", 
+                       TRUE ~ .)) 
+  
+
+# Supplemental Tables
+
+
+```{r}
+Supp_Table <- CDE_forAnalysis %>% 
+  filter(NUP98.Rearranged.Groups=="NUP98-X") %>% 
+  mutate(`Study Group`="COG") %>% 
+  
+  mutate_at(vars(FLT3.ITD.positive.), ~case_when(
+    grepl("Yes", .) ~ "FLT3", 
+    TRUE ~ NA_character_
+  )) %>% 
+  mutate_at(vars(WT1.mutation.), ~case_when(
+    grepl("Yes", .) ~ "WT1",
+    TRUE ~ NA_character_
+  )) %>% 
+  mutate_at(vars(NPM.mutation.), ~case_when(
+    grepl("Yes", .) ~ "NPM1",
+    TRUE ~ NA_character_
+  )) %>% 
+  mutate_at(vars(SCT.in.1st.CR), ~ifelse(.=="Unknown", "N/A", .)) %>% 
+  unite(`Molecular genetics`, FLT3.ITD.positive., NPM.mutation., WT1.mutation., sep=", ", na.rm=TRUE) %>% 
+  unite(Outcome, EFS.event.type.ID,OS.event.ID, sep=", ", na.rm=TRUE) %>% 
+  mutate_at(vars(Outcome), ~gsub("dead", "died", tolower(.)) %>%
+              Hmisc::capitalize(.)) %>% 
+  
+
+  mutate(X=gsub("NUP98-", "", NUP98.Rearranged), 
+         Age=round(Age.in.years, digits=1),
+         Gender=substr(Sex,start = 1,stop = 1)) %>% 
+  select(USI,`Study Group`, 
+         Gender,
+         Age,
+         ISCN,
+         deletion_chr13,
+         `WBC (x10^9/l)`=WBC..x10.3.MicroLiter..levels,
+          X, `Molecular genetics`, 
+         `SCT in CR1`=SCT.in.1st.CR, Outcome) %>% 
+  arrange(X, desc(Age))
+
+# View(Supp_Table)
+```
+
+*Add information if partner is the telomeric 
+*only include the karyotype string for the NUP98 fusion (not all)
+
+```{r}
+# write.csv(Supp_Table, "TARGET_AML_NUP98-X_Clinical_Supplemental_Table_1.csv", row.names = FALSE)
+```
+
+```{r}
+Supp_Table_chr13 <- CDE_forAnalysis %>% 
+  select(USI, NUP98.Rearranged.Groups, matches("_chr13$|_13$")) %>% 
+  filter(NUP98.Rearranged.Groups=="NUP98-KDM5A") %>% 
+  arrange(deletion_chr13, monosomy_trisomy_13, translocation_13)
+
+# Supp_Table_chr13
+# write.csv(Supp_Table_chr13, "TARGET_AML_NUP98.KDM5A_Chr13_Supplemental_Table_3.csv", row.names = FALSE)
+```
+
+# NUP98-X Partner Barplot
+
+```{r}
+NUP.X.Parters <- filter(CDE_forAnalysis, NUP98.Rearranged.Groups == "NUP98-X") %>% 
+  pull(NUP98.Rearranged) %>% 
+  str_split_fixed(., patter="-", n=2)
+
+length(unique(NUP.X.Parters[,2]))
+unique(NUP.X.Parters[,2])
+
+table(grepl("HOX", unique(NUP.X.Parters[,2])))
+```
+
+```{r}
+CDE_forAnalysis %>% 
+  filter(NUP98.Rearranged.Groups=="NUP98-X") %>% 
+  mutate(HOX.NUP=ifelse(grepl("HOX", NUP98.Rearranged),"Yes","No"), 
+                        Total=n()) %>% 
+  select(USI, NUP98.Rearranged, HOX.NUP,Total) %>% 
+  arrange(desc(HOX.NUP)) %>%
+  group_by(HOX.NUP,Total) %>%
+  summarize(N=n()) %>%
+  mutate(Percent=N/Total*100)
+```
+
+```{r}
+CDE_forAnalysis %>% 
+  mutate(NUP98.Group=ifelse(grepl("NUP98", NUP98.Rearranged.Groups), "Yes", "No"),
+         Total=n()) %>% 
+  group_by(NUP98.Group,Total) %>% 
+  summarize(N=n()) %>%
+  mutate(Percent=N/Total*100)
+
+CDE_forAnalysis %>% 
+  mutate(Total=n()) %>% 
+  group_by(NUP98.Rearranged.Groups,Total) %>% 
+  summarize(N=n()) %>%
+  mutate(Percent=N/Total*100)
+```
+
+```{r}
+CDE_forAnalysis %>% 
+  # filter(NUP98.Rearranged.Groups)
+  group_by(NUP98.Rearranged.Groups) %>%
+  mutate(Total=n(),
+         median_age=median(Age.in.years, na.rm=TRUE)) %>% 
+  group_by(Age.Category,Total, add=TRUE) %>%
+  mutate(N=n()) %>%
+  mutate(Percent=N/Total*100) %>%
+  select(NUP98.Rearranged.Groups, Age.Category, median_age, N, Total, Percent) %>%
+  arrange(NUP98.Rearranged.Groups, desc(N)) %>% 
+  unique()
+```
+
+
+```{r fig.width=12}
+df <- CDE_forAnalysis %>% filter(NUP98.Rearranged.Groups=="NUP98-X")  %>% 
+  group_by(NUP98.Rearranged) %>% 
+  summarize(N=n()) %>% 
+  arrange(desc(N)) %>% 
+  mutate(NUP98.Rearranged=factor(NUP98.Rearranged, levels=unique(NUP98.Rearranged)), 
+         Homeobox=ifelse(grepl("HOX|PRRX1", NUP98.Rearranged), "Yes", "No"))
+ 
+# df
+colors_groups <- c(brewer.pal(n=9,"Set1"),brewer.pal(n=4,"Dark2")) %>% 
+  set_names(df$NUP98.Rearranged)
+# saveRDS(colors_groups,"TARGET_AML_NUP98.X_ColorCodes.RDS")
+
+
+# pdf("NUP98-X_Fusion_Partners.pdf", width=15, height=5)
+ggplot(data=df, aes(x=NUP98.Rearranged,y=N, fill=NUP98.Rearranged, color=Homeobox)) +
+  geom_bar(stat="identity", position = "dodge", size=2, width = 0.7) +
+  scale_fill_manual(values = colors_groups) +
+  scale_color_manual(values=c("grey90","black")) +
+  labs(y="Number of Samples", x="", title="NUP98-X: Heterogenous NUP98 Fusion Partners") +
+  theme_classic()+
+  theme(plot.title = element_text(size=20),
+        axis.title = element_text(size=20),
+        axis.text.y=element_text(size=18, color="black"),
+        axis.text.x = element_text(angle=35, size=18, hjust=1,vjust=1,
+                                   color="black"),
+        plot.margin = margin(l=2.5, unit="cm")) +
+  guides(fill=guide_legend(ncol=3, nrow=5))
+# dev.off()
+
+```
+
+```{r}
+# filter(CDE_forAnalysis, grepl("KMT2A-X", Primary.Fusion)) %>%
+# select(USI, Primary.Fusion, Age.Category, ISCN) %>% 
+#   arrange(Age.Category) %>% 
+#   View()
+```
+
+
+
+
+# Table of NUP98 Fusions
+
+```{r}
+NUP98.Fusions <- CDE_forAnalysis %>% 
+  group_by(NUP98.Rearranged) %>% 
+  summarise(N=n()) %>%
+  arrange(desc(N)) %>% 
+  rename_all(., ~c("AML_Subtype","Number_of_Cases")) %>%
+  mutate(Category=ifelse(Number_of_Cases < 10, "NUP98-X", AML_Subtype)) %>% 
+  mutate(AML_Subtype=gsub("OtherAML", "Heterogenous AML patients",AML_Subtype ))
+
+# NUP98.Fusions
+# write.csv(NUP98.Fusions, "TARGET_AML_NUP98.Rearranged_Fusions_Frequency_7.15.2020.csv", row.names = FALSE)
+```
+
+```{r}
+# filter(NUP98.Fusions, Category=="NUP98-X") %>% 
+#   mutate(total=sum(Number_of_Cases))
+```
+
+```{r}
+cyto.vs.seq <- CDE_forAnalysis %>% 
+  filter(NUP98.Rearranged.Groups=="NUP98-X") %>% 
+  select(USI, NUP98.Rearranged, ISCN, Cyto_vs_Seq_Fusions) %>% 
+  mutate(HasCytoEvidence=ifelse(grepl("p15", ISCN), "Yes", "No")) 
+
+
+
+table(cyto.vs.seq$HasCytoEvidence)
+# View(cyto.vs.seq)
+```
+
+
+
+# NUP98 Fusions per Age group
+
+```{r}
+# install.packages("patchwork")
+library(patchwork)
+```
+
+```{r}
+age.groups <- CDE_forAnalysis %>% 
+  filter(grepl("NUP98", NUP98.Rearranged.Groups)) %>% 
+  select(USI, Reg., NUP98.Rearranged.Groups, Age.in.years) %>% 
+  mutate(NUP98.Rearranged.Groups=factor(NUP98.Rearranged.Groups, 
+                                        levels=c("NUP98-NSD1",
+                                                 "NUP98-KDM5A",
+                                                 "NUP98-X"))) %>% 
+  
+  mutate(Age.Category=factor(case_when(
+    Age.in.years < 3 ~ "<3 years",
+    Age.in.years >= 3 & Age.in.years < 5 ~ "3-4 years",
+    Age.in.years >= 5 & Age.in.years < 10 ~ "5-10 years",
+    Age.in.years >= 10 ~ ">10 years"),
+          levels=c("<3 years", "3-4 years","5-10 years",">10 years"))) %>% 
+  
+  mutate(Age.Group=factor(case_when(
+    Age.in.years < 1.0 ~ "< 1 year old",
+    Age.in.years >= 1.0 & Age.in.years < 3 ~ "1-2 years old",
+    Age.in.years >= 3 & Age.in.years < 5 ~ "3-4 years old",
+    Age.in.years >= 5 & Age.in.years < 10 ~ "5-9 years old",
+    Age.in.years >= 10 & Age.in.years < 18 ~ "10-18 years old",
+    Age.in.years >= 18 ~ "> 18 years old"),
+          levels=c("< 1 year old","1-2 years old","3-4 years old",
+                   "5-9 years old", "10-18 years old", "> 18 years old"))) 
+ 
+age.groups.summ <- age.groups %>%  
+    group_by(NUP98.Rearranged.Groups,Age.Group,.drop=FALSE) %>% 
+    summarise(N=n()) %>% 
+    mutate(Percent=round(N/sum(N)*100, digits = 2)) %>% 
+    ungroup() %>% 
+    mutate(Label=paste0(round(Percent, digits = 0), "%"))
+
+age.cat.summ <- age.groups %>%  
+    group_by(NUP98.Rearranged.Groups,Age.Category,.drop=FALSE) %>% 
+    summarise(N=n()) %>% 
+    mutate(Percent=round(N/sum(N)*100, digits = 2)) %>% 
+    ungroup() %>% 
+    mutate(Label=paste0(round(Percent, digits = 0), "%"))
+  
+# age.groups
+```
+
+```{r fig.width=15, fig.height=7}
+nup_colors <- c(`NUP98-NSD1` = "cornflowerblue", 
+        `NUP98-KDM5A`= "magenta",
+        `NUP98-X`= "green1")
+
+age.plot.detailed <- ggplot(age.groups.summ, aes(x=Age.Group, y=Percent)) +
+  geom_col(aes(fill=NUP98.Rearranged.Groups), 
+           color="black",width = 0.7,
+           position = position_dodge()) +
+  scale_y_continuous(breaks=seq(0,60, by=10), limits=c(0,60)) +
+  scale_fill_manual(values=nup_colors) +
+  labs(x="", y="Prevalence (%)") +
+  theme_minimal() + 
+  theme(axis.text.y = element_text(size=14, color="black"),
+        axis.text.x = element_text(size=14, color="black"),
+        axis.title.y = element_text(size=18, color="black"),
+        text = element_text(size=14, color="black"), 
+        panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank())
+
+# age.plot.detailed
+tbl <- ggplot(age.groups.summ, aes(x = Age.Group,y = NUP98.Rearranged.Groups, label=Label)) +
+    geom_text(size = 6)  +
+    theme_bw()+
+    xlab(NULL) +
+    ylab(NULL) +
+  scale_y_discrete(limits=c("NUP98-X","NUP98-KDM5A","NUP98-NSD1")) +
+    theme(panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          panel.border = element_blank(),
+          legend.position="none",
+          axis.line = element_line(size=0.7, color="black"),
+          axis.title.x = element_text(size=18),
+          axis.ticks.x = element_blank(),
+          axis.title.y = element_blank(),
+          axis.text.x = element_blank(),
+          axis.text.y = element_text(face="bold",
+                                     color = rev(nup_colors),
+                                     size=14,
+                                     hjust=1))
+
+# tbl
+
+# pdf("TARGET_AML_Age_Barplot_1yrolds.pdf", height = 7, width = 15)
+age.plot.detailed / tbl +
+  plot_layout(heights = c(1,0.25))
+# dev.off()
+```
+
+```{r fig.width=15, fig.height=7}
+nup_colors <- c(`NUP98-NSD1` = "cornflowerblue", 
+        `NUP98-KDM5A`= "magenta",
+        `NUP98-X`= "green1")
+
+age.plot.cats <- ggplot(age.cat.summ, aes(x=Age.Category, y=Percent)) +
+  geom_col(aes(fill=NUP98.Rearranged.Groups), 
+           color="black",width = 0.7,
+           position = position_dodge()) +
+  # geom_density(stat = "identity", 
+  #              aes(group = NUP98.Rearranged.Groups, fill = NUP98.Rearranged.Groups),
+  #              alpha = 0.3) +
+  scale_y_continuous(breaks=seq(0,60, by=10), limits=c(0,60)) +
+  scale_fill_manual(values=nup_colors) +
+  labs(x="", y="Prevalence (%)") +
+  theme_minimal() + 
+  theme(axis.text.y = element_text(size=14, color="black"),
+        axis.text.x = element_text(size=14, color="black"),
+        axis.title.y = element_text(size=18, color="black"),
+        text = element_text(size=14, color="black"), 
+        panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank())
+
+# age.plot.detailed
+tbl.cat <- ggplot(age.cat.summ, aes(x = Age.Category,y = NUP98.Rearranged.Groups, label=Label)) +
+    geom_text(size = 6)  +
+    theme_bw()+
+    xlab(NULL) +
+    ylab(NULL) +
+  scale_y_discrete(limits=c("NUP98-X","NUP98-KDM5A","NUP98-NSD1")) +
+    theme(panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          panel.border = element_blank(),
+          legend.position="none",
+          axis.line = element_line(size=0.7, color="black"),
+          axis.title.x = element_text(size=18),
+          axis.ticks.x = element_blank(),
+          axis.title.y = element_blank(),
+          axis.text.x = element_blank(),
+          axis.text.y = element_text(face="bold",
+                                     color = rev(nup_colors),
+                                     size=14,
+                                     hjust=1))
+
+# tbl
+
+# pdf("TARGET_AML_Age_Barplot_3yrolds.pdf", height = 7, width = 12)
+# age.plot.cats / tbl.cat +
+#   plot_layout(heights = c(1,0.25))
+# dev.off()
+```
+
+# Clinical Characteristics Table
+
+```{r}
+# library(compareGroups)
+```
+
+```{r}
+# colnames(CDEs)
+cols <-read.csv(file.path(TARGET,
+                          "Clinical/metadata/TARGET_AML_Clinical_Columns_for_Analysis_7.24.20.csv"))$x
+
+cols <- gsub("Cyto.Fusion.Molecular.Risk","Cyto.Fusion.Molecular.Risk_update", cols) 
+cols <-  cols[-grep("Monosomy13_Del13q",cols)]
+
+table(cols %in% colnames(CDE_forAnalysis))
+
+
+# cols <- colnames(CDE_forAnalysis)[c(3:16,89,140,
+#                          87:88,86,50,19:21, 
+#                          25:26,29,31:33,
+#                          68:84,61,63,
+#                          142)] %>% 
+# c("NUP98.Rearranged.Groups", .)
+# write.csv(cols,"TARGET_AML_Clinical_Columns_for_Analysis.csv", row.names=FALSE)
+```
+
+
+```{r}
+NUP98.X_forEline <- CDE_forAnalysis %>% 
+  dplyr::select(USI,ISCN,NUP98.Rearranged,NUP98.Rearranged.Groups, 
+                 EFS.event.type.ID,OS.event.ID,OS.time..days. ,EFS.time..days.,
+                one_of(cols)) %>% #Reg.,USI,
+  filter(grepl("NUP98-X", NUP98.Rearranged.Groups)) %>%
+  mutate_at(vars(NUP98.Rearranged.Groups), 
+            ~gsub("OtherAML","AML_without_NUP98_rearrangement",.)) %>%
+  
+  mutate_at(vars(Age.Category),
+            ~case_when(
+              .== "Greater than 18 years" ~ "Greater than 10 years",
+              .=="Between 10 and 18 years"~ "Greater than 10 years",
+              TRUE ~ .)) %>%
+  
+  mutate_if(is.character, ~case_when(
+    .=="Unknown" ~ NA_character_,
+    .=="unknown" ~ NA_character_,
+    .=="Not reported" ~ NA_character_,
+    .=="<0.1" ~ NA_character_,
+    grepl("^\\.$", .) ~ NA_character_,
+    TRUE ~ .))  %>%
+
+  mutate_at(vars(Protocol),
+            ~ifelse(is.na(.), "Unknown", .)) %>%
+  mutate_at(vars(USI), ~ifelse(is.na(.), "Unknown",.)) %>%
+  arrange(NUP98.Rearranged)
+
+
+
+# table(NUP98.X_forEline$Age.Category)
+
+# View(NUP98.X_forEline)
+# write.csv(NUP98.X_forEline, "Tables/TARGET_AML_NUP98-X_Clinical_Data_Elements_8.01.2020.csv")
+```
+
+```{r}
+dat <- CDE_forAnalysis %>% 
+  dplyr::select(Reg.,USI,one_of(cols)) %>% #Reg.,USI,
+  mutate_at(vars(NUP98.Rearranged.Groups), 
+            ~gsub("OtherAML","AML_without_NUP98_rearrangement",.)) %>%
+  
+  mutate_at(vars(NUP98.Rearranged.Groups), 
+            ~factor(., levels=unique(.))) %>%
+  
+  mutate_at(vars(Age.Category),
+            ~case_when(
+              .== "Greater than 18 years" ~ "Greater than 10 years",
+              .=="Between 10 and 18 years"~ "Greater than 10 years",
+              TRUE ~ .)) %>%
+  
+  mutate_if(is.character, ~case_when(
+    .=="Unknown" ~ NA_character_, 
+    .=="unknown" ~ NA_character_, 
+    .=="Not reported" ~ NA_character_,
+    .=="<0.1" ~ NA_character_,
+    grepl("^\\.$", .) ~ NA_character_,
+    TRUE ~.))  %>% 
+  mutate_at(vars(Protocol),
+            ~ifelse(is.na(.), "Unknown", .))
+
+
+# View(dat)
+dim(dat) #2396   47
+table(dat$Protocol, useNA='ifany')
+table(dat$CR.status.at.end.of.course.2,useNA='ifany')
+table(dat$Age.Category)
+```
+
+```{r}
+levels(dat$NUP98.Rearranged.Groups)
+table(dat$NUP98.Rearranged.Groups)
+```
+
+
+### Make the tables 
+
+```{r}
+input <- list(all_Studies=select(dat, -one_of(c("Reg.","USI"))),
+              AAML1031_0531=select(dat, -one_of(c("Reg.","USI"))) %>% 
+                filter(Protocol=="AAML1031" | Protocol == "AAML0531"))
+
+date_made <- "8.01.20"
+
+lapply(input, dim)
+lapply(input, function(x) table(x$NUP98.Rearranged.Groups, useNA='ifany'))
+```
+
+```{r message=FALSE,warning=FALSE}
+
+comparisons <- list()
+
+for (i in 1:2){
+  
+  all.comp <- compareGroups(
+                        formula = NUP98.Rearranged.Groups ~ .,
+                        data = input[[i]],
+                        method = 4,
+                        max.ylev = 7,
+                        max.xlev = 10,
+                        Q1 = 0,
+                        Q3 = 1,
+                        ref = 1,
+                        p.corrected = TRUE,
+                        include.miss = FALSE)
+
+  table.final <- createTable(all.comp)
+  
+  name <- names(input)[i]
+  export2csv(table.final,paste0("Tables/csv_files/All_NUP98-Rearranged_",
+                                name,"_Clinical_Characteristics_",date_made,".csv"))
+
+  for (group in levels(input[[i]]$NUP98.Rearranged.Groups)[-1]) {
+    
+    df <- filter(input[[i]], 
+                 NUP98.Rearranged.Groups %in%
+                c("AML_without_NUP98_rearrangement",
+                  group))%>% 
+      select(-one_of(c("Reg.","USI"))) %>%
+      droplevels()
+  
+    comp <- compareGroups(
+              formula = NUP98.Rearranged.Groups ~ .,
+                        data = df,
+                        method = 4,
+                        max.ylev = 7,
+                        max.xlev = 10,
+                        Q1 = 0,
+                        Q3 = 1,
+                        ref = 1,
+                        p.corrected = TRUE,
+                        include.miss = FALSE)
+
+    name <- paste(group, names(input)[i], sep="_")
+    comparisons[[name]] <- comp
+    tab <- createTable(comp)
+    
+    print(c(name, dim(df)))
+    export2csv(tab,paste0("Tables/csv_files/",name,"_AML_Clinical_Characteristics_",date_made,".csv"))
+    rm(tab,comp)
+  }
+}
+```
+
+```{r}
+res_all <- dir(path = "Tables/csv_files",pattern = "NUP98.+Studies.+Clinical.+csv",full.names = TRUE)
+gc()
+
+for (file in res_all){
+  temp <- read.delim(file,sep = ",",
+                     header = FALSE)
+  
+  group <- str_split_fixed(basename(file), "_",n=2)[,1]
+  filename <- paste0("TARGET_AML_NUP98-Rearranged_all_Studies_Clinical_Characteristics_",date_made,".xlsx")
+  print(group)
+  print(filename)
+  append <- ifelse(file.exists(filename), TRUE, FALSE)
+
+  write.xlsx(temp, filename,
+             append=append,
+             sheetName = group,
+             col.names = FALSE,
+             row.names = FALSE)
+  rm(file,group)
+}
+
+
+res_1031_0531 <- dir(path = "Tables/csv_files", pattern = "NUP98.+AAML103.+Clinical.+csv", full.names = TRUE)
+gc()
+
+for (file in res_1031_0531){
+  temp <- read.delim(file,sep = ",",
+                     header = FALSE)
+  
+  group <- str_split_fixed(basename(file),"_",n=2)[,1]
+  filename <- paste0("TARGET_AML_NUP98-Rearranged_AAML1031_0531_Clinical_Characteristics_",
+                     date_made,".xlsx")
+  print(group)
+  print(filename)
+  append <- ifelse(file.exists(filename), TRUE, FALSE)
+
+  write.xlsx(temp, filename,
+             append=append,
+             sheetName = group,
+             col.names = FALSE,
+             row.names = FALSE)
+  rm(file,group)
+}
+
+getwd()
+```
+
+```{r fig.height=5, fi.width=5}
+# plot(comparisons$`NUP98-NSD1`, bivar = T)
+```
+
+Note: DEK-NUP214 is t(6;9)
+Inv(16) is CBFB-MYH11
+t(8;21) is RUNX1-RUNX1T1
+
+```{r}
+# filter(CDE_forAnalysis, grepl("NUP98", NUP98.Rearranged.Groups)) %>% 
+#   select(USI,NUP98.Rearranged.Groups,MLL,NUP98.Rearranged,
+#          Primary.Fusion.CNV,
+#          Additional.Fusions.CNV,
+#          ISCN, Cyto.vs..Seq) %>% 
+#   View()
+```
+
+# FAB in NUP98 
+
+```{r}
+library(compareGroups)
+```
+
+```{r}
+FAB_Cleaned <- CDE_forAnalysis %>%  
+  select(USI,Protocol,NUP98.Rearranged.Groups, FAB=FAB_or_WHO.Classification) %>% 
+  mutate(FAB_WHO_Clean=case_when(
+    grepl("Acute monoblastic\\/.+monocytic|M5", FAB) ~ "M5/Acute monoblastic/monocytic leukemia",
+    grepl("AML with maturation|M2", FAB) ~ "M2/AML with maturation",
+    grepl("AML without maturation|M0", FAB) ~ "M0/AML without maturation",
+    grepl("Acute myelomonocytic leukemia|M4", FAB) ~ "M4/Acute myelomonocytic leukemia",
+    grepl("AML, with minimal differentiation|M1", FAB) ~ "M1/AML, with minimal differentiation",
+    grepl("Acute megakaryoblastic leukemia|M7", FAB) ~ "M7/Acute megakaryoblastic leukemia",
+    FAB=="Unknown" | FAB=="Other" ~ NA_character_, 
+    TRUE ~ "Other")) %>% 
+  filter(!is.na(FAB_WHO_Clean)) # Need to remove unknowns
+
+
+## Create individual columns 
+groups <- unique(grep("^M", FAB_Cleaned$FAB_WHO_Clean, value=TRUE)) %>% 
+  set_names(janitor::make_clean_names(.))
+
+WHO.class <- unique(grep("^AML",FAB_Cleaned$FAB, value=TRUE)) %>% 
+  set_names(janitor::make_clean_names(.))
+
+FAB.class <- unique(grep("NOS|^M[0-9]",FAB_Cleaned$FAB, value=TRUE)) %>% 
+  set_names(janitor::make_clean_names(.))
+```
+
+### NUP98-NSD1
+
+```{r}
+NUP98.NSD1.FAB <- FAB_Cleaned %>%
+  filter(NUP98.Rearranged.Groups=="NUP98-NSD1"| NUP98.Rearranged.Groups=="OtherAML") %>%
+  add_column(!!!groups) %>% 
+  mutate(across(all_of(names(groups)), ~case_when(
+    .x==FAB_WHO_Clean ~ FAB_WHO_Clean,
+    TRUE ~ "Other"))) %>% 
+  
+  add_column(!!!WHO.class) %>% 
+  mutate(across(all_of(names(WHO.class)), ~case_when(
+    .x==FAB ~ FAB,
+    TRUE ~ "Other"))) %>% 
+  
+  add_column(!!!FAB.class) %>% 
+  mutate(across(all_of(names(FAB.class)), ~case_when(
+    .x==FAB ~ FAB,
+    TRUE ~ "Other")))
+
+
+dim(NUP98.NSD1.FAB)
+table(NUP98.NSD1.FAB$NUP98.Rearranged.Groups)
+table(NUP98.NSD1.FAB$NUP98.Rearranged.Groups,
+      NUP98.NSD1.FAB$Protocol)
+```
+
+```{r warning=FALSE}
+#### 1031 
+NSD1.FAB.1031 <- NUP98.NSD1.FAB %>% 
+  filter(Protocol=="AAML1031") %>% 
+  select(NUP98.Rearranged.Groups, Protocol, matches("^aml"))
+
+NSD1.1031.comp.FAB <- compareGroups(NUP98.Rearranged.Groups ~ ., 
+                               data=NSD1.FAB.1031)
+
+# dir.create("FAB_Enrichment")
+# export2csv(createTable(NSD1.1031.comp.FAB), "FAB_Enrichment/NUP98.NSD1_vs_OtherAML_AAML1031_WHO_classification.csv")
+```
+
+```{r warning=FALSE}
+#### 0531
+NSD1.FAB.0531<- NUP98.NSD1.FAB %>% 
+  filter(Protocol=="AAML0531") %>% 
+  select(NUP98.Rearranged.Groups, Protocol, matches("^m[0-9]$|^nos"))
+
+NSD1.0531.comp.FAB <- compareGroups(NUP98.Rearranged.Groups ~ ., 
+                               data=NSD1.FAB.0531)
+
+# dir.create("FAB_Enrichment")
+
+
+# createTable(NSD1.0531.comp.FAB)
+# export2csv(createTable(NSD1.0531.comp.FAB), "FAB_Enrichment/NUP98.NSD1_vs_OtherAML_AAML0531_FAB_classification.csv")
+```
+
+```{r warning=FALSE}
+#### combined
+NSD1.comp.FAB <- compareGroups(NUP98.Rearranged.Groups ~ ., 
+                               data=select(NUP98.NSD1.FAB,
+                                           NUP98.Rearranged.Groups, Protocol, matches("^m[0-9]_")))
+
+# dir.create("FAB_Enrichment")
+# export2csv(createTable(NSD1.comp.FAB), "FAB_Enrichment/NUP98.NSD1_vs_OtherAML_FAB_and_WHO_classification.csv")
+```
+
+
+### NUP98-X
+
+```{r}
+NUP98.X.FAB <- FAB_Cleaned %>%
+  filter(NUP98.Rearranged.Groups=="NUP98-X"| NUP98.Rearranged.Groups=="OtherAML") %>%
+  add_column(!!!groups) %>% 
+  mutate(across(all_of(names(groups)), ~case_when(
+    .x==FAB_WHO_Clean ~ FAB_WHO_Clean,
+    TRUE ~ "Other"))) %>% 
+  
+  add_column(!!!WHO.class) %>% 
+  mutate(across(all_of(names(WHO.class)), ~case_when(
+    .x==FAB ~ FAB,
+    TRUE ~ "Other"))) %>% 
+  
+  add_column(!!!FAB.class) %>% 
+  mutate(across(all_of(names(FAB.class)), ~case_when(
+    .x==FAB ~ FAB,
+    TRUE ~ "Other")))
+
+
+# dim(NUP98.X.FAB)
+# table(NUP98.X.FAB$NUP98.Rearranged.Groups)
+# table(NUP98.X.FAB$NUP98.Rearranged.Groups,
+#       NUP98.X.FAB$Protocol)
+```
+
+```{r warning=FALSE}
+#### 1031 
+X.FAB.1031 <- NUP98.X.FAB %>% 
+  filter(Protocol=="AAML1031") %>% 
+  select(NUP98.Rearranged.Groups, Protocol, matches("^aml"))
+
+X.1031.comp.FAB <- compareGroups(NUP98.Rearranged.Groups ~ ., 
+                               data=X.FAB.1031)
+
+# dir.create("FAB_Enrichment")
+# export2csv(createTable(X.1031.comp.FAB), "FAB_Enrichment/NUP98.X_vs_OtherAML_AAML1031_WHO_classification.csv")
+```
+
+```{r warning=FALSE}
+#### 0531
+X.FAB.0531<- NUP98.X.FAB %>% 
+  filter(Protocol=="AAML0531") %>% 
+  select(NUP98.Rearranged.Groups, Protocol, matches("^m[0-9]$|^nos"))
+
+X.0531.comp.FAB <- compareGroups(NUP98.Rearranged.Groups ~ ., 
+                               data=NSD1.FAB.0531)
+
+# dir.create("FAB_Enrichment")
+
+# 
+# createTable(NSD1.0531.comp.FAB)
+# export2csv(createTable(X.0531.comp.FAB), "FAB_Enrichment/NUP98.X_vs_OtherAML_AAML0531_FAB_classification.csv")
+```
+
+```{r warning=FALSE}
+#### combined
+X.comp.FAB <- compareGroups(NUP98.Rearranged.Groups ~ ., 
+                               data=select(NUP98.X.FAB,
+                                           NUP98.Rearranged.Groups, Protocol, matches("^m[0-9]_")))
+
+# dir.create("FAB_Enrichment")
+# export2csv(createTable(X.comp.FAB), "FAB_Enrichment/NUP98.X_vs_OtherAML_FAB_and_WHO_classifcation.csv")
+```
+
+
+# Karyotype Results and Chr13 Deletions
+
+```{r}
+NUPs <- CDE_forAnalysis %>% 
+  filter(grepl("NUP98", NUP98.Rearranged.Groups)) %>% 
+  pull(USI)
+
+cytobands <- read.delim(file.path(PROJHOME, "0000.00.02_Reference_GeneInfo/cytoBand.txt"),
+                        header=F) %>% 
+  rename_all(~c("chrom",	"chromStart",	"chromEnd",	"name",	"gieStain")) %>% 
+  filter(chrom == "chr13")  %>% 
+  mutate(simpleBand=str_split_fixed(name,"\\.", n=2)[,1])
+
+# head(cytobands)
+# dim(cytobands) #36 bands
+```
+
+```{r eval=FALSE}
+#I need to run the same code on all patient clinical data b/c the transcriptomics includes patients on Arm D who are excluded by COG for the manuscript. 
+chr13_allpts <- merged %>% 
+  select(-NUP98.Rearranged.Groups, -NUP98.Rearranged) %>% 
+  inner_join(., NUP98.cohort, by="Reg.") %>% 
+   select(Reg.,USI,NUP98.Rearranged.Groups,
+          NUP98.Rearranged, ISCN) %>% 
+  mutate(
+    deletion_chr13=case_when(
+      grepl("del\\(13", ISCN) ~ gsub("^.+(del\\(13\\)\\(.{6,10}\\)).+","\\1",ISCN)),
+    
+    monosomy_trisomy_13=case_when(
+      grepl("-13", ISCN) ~ "monosomy13",
+      grepl("\\+13", ISCN) ~ "trisomy13"), 
+    
+    Translocation_13=case_when(
+      grepl("t\\([0-9]{1,2};13\\)", ISCN) ~ gsub("^.+(t\\([0-9]{1,2};13\\)\\(.{5,13}\\))[,\\s\\b\\[].+","\\1", ISCN), 
+      grepl("t\\(13;[0-9]{1,2}\\)", ISCN) ~ gsub("^.+(t\\(13;[0-9]{1,2}\\)\\s?\\(.{5,13}\\))[,\\s\\b\\[].+","\\1", ISCN))) %>% 
+  
+  #defined the chr13abn as deletions, translocaitons, and monosomy, since trisomy likely has opposite effect on transcriptome differences. 
+  mutate(Any_chr13_Abnormality=ifelse(!is.na(deletion_chr13)  | !is.na(Translocation_13) | grepl("monosomy13",monosomy_trisomy_13), "chr13_Abnormality", "OtherAML"), 
+         Any_chr13_Deletion=ifelse(!is.na(deletion_chr13), "chr13_deletion", "OtherAML"),
+         Any_chr13_CNV=ifelse(!is.na(deletion_chr13) | grepl("monosomy13",monosomy_trisomy_13), "chr13_CNV", "OtherAML")) %>% 
+  
+  #Extract the cytoband form the ISCN strings
+  mutate(translocation_13_band=case_when(
+    grepl("t\\([0-9]{1,2};13\\)", ISCN) ~ gsub("^.+13\\).+([pq][0-9]{1,2}(.{0,3})?)\\)","\\1",Translocation_13, perl = TRUE), 
+    grepl("t\\(13;[0-9]{1,2}\\)", ISCN) ~ gsub("t.13.+\\(([pq][0-9]{1,2}(.[0-9]{1,2})?);?[pq].+\\)","\\1",Translocation_13, perl = TRUE))) %>%
+  
+  mutate(deletion_13_band_start=gsub("^.+([pq][0-9]{2}(.[0-9]{1,2})?);?[pq][0-9].+","\\1",deletion_chr13,perl = TRUE)) %>% 
+  mutate(deletion_13_band_end=gsub("^.+[0-9]([pq][0-9]{2}(.[0-9]{1,2})?)\\)$","\\1",deletion_chr13,perl = TRUE)) %>% 
+  
+  rowwise() %>% 
+  mutate(deletion_13_start=get_locus(in_band = deletion_13_band_start,
+                                     type = "start", 
+                                     cytobands = cytobands),
+         deletion_13_end=get_locus(in_band = deletion_13_band_end,
+                                   type = "end", 
+                                   cytobands = cytobands), 
+         translocation_13_start=get_locus(in_band = translocation_13_band,
+                                   type = "start", 
+                                   cytobands = cytobands),
+         translocation_13_end=get_locus(in_band = translocation_13_band,
+                                   type = "end", 
+                                   cytobands = cytobands)) %>% 
+  ungroup() %>% 
+  mutate_at(vars(deletion_13_start,deletion_13_end), as.numeric) 
+
+dim(chr13_allpts) #2296   18
+table(chr13_allpts$NUP98.Rearranged.Groups)
+# write.csv(chr13_allpts,"Chr13_Deletions/TARGET_AML_chr13_abnormalities_by_Karyotype_allPatients.csv", row.names = F)
+# rm(chr13_allpts)
+
+
+chr13 <- chr13_allpts %>%
+  filter(USI %in% CDE_forAnalysis$USI) %>% 
+  filter(ISCN != "Unknown")
+
+
+# write.csv(chr13,"Chr13_Deletions/TARGET_AML_chr13_abnormalities_by_Karyotype_Manuscript_Eligable_Pts.csv", row.names = F)
+dim(chr13) #2148   18
+```
+
+```{r}
+addmargins(table(chr13$Any_chr13_Abnormality, chr13$NUP98.Rearranged.Groups))
+addmargins(table(chr13$Any_chr13_Deletion, chr13$NUP98.Rearranged.Groups))
+```
+
+We're missing 89 samples's ISCN data for some reason (well some just have not adequate material), but the many type-os are concerning (eg I,F, G, etc). 
+
+```{r}
+# forCOG <- chr13 %>% 
+#   select(Reg.,Any_chr13_Abnormality:Any_chr13_CNV,
+#          deletion_chr13:Translocation_13, 
+#          ISCN) %>% 
+#   right_join(., select(CDE_forAnalysis,Reg.,Protocol, NUP98.Rearranged.Groups), 
+#              by="Reg.") %>% 
+#   arrange(NUP98.Rearranged.Groups, Any_chr13_Abnormality, Any_chr13_Deletion,Any_chr13_CNV) %>% 
+#   select(Reg.,Protocol, NUP98.Rearranged.Groups, everything(), ISCN)
+# 
+# dim(forCOG)
+# write.csv(forCOG, "Chr13_Deletions/TARGET_AML_NUP98-R_Chr13_Groups.csv",row.names = FALSE)
+
+
+forSoheil <- read.csv("Chr13_Deletions/TARGET_AML_chr13_abnormalities_by_Karyotype_Manuscript_Eligable_Pts.csv") %>% 
+  select(Reg.:ISCN, matches("chr13|_13"),NUP98_Exons, Cyto_vs_Seq_Fusions,
+         Protocol:Group, -matches("band|start|end")) %>% 
+  filter(NUP98.Rearranged.Groups!="OtherAML") %>% 
+  mutate_at(vars(NUP98_Exons), ~case_when(
+    Cyto_vs_Seq_Fusions=="RNA seq only" & is.na(.) ~ "TARGET 21 polyA RNAseq", #looked it up on GD 
+    TRUE ~ .)) %>% 
+  arrange(NUP98.Rearranged.Groups,Any_chr13_Abnormality)
+
+
+# write.csv(forSoheil,"TARGET_AML_NUP98_Cohort_hr13_abnormalities_by_Karyotype_Manuscript_Eligable_Pts.csv", row.names = FALSE)
+```
+
+
+
+## Chr13 Characteristics in NUP98-R
+
+```{r}
+library(compareGroups)
+```
+
+```{r}
+all_KDM5A <- merged %>% 
+  filter(grepl("KDM5A", Primary.Fusion)) %>% 
+  select(USI,Reg., Primary.Fusion, ISCN)
+
+# chr13.kdm5A <- filter(chr13, NUP98.Rearranged.Groups=="NUP98-KDM5A") %>% 
+#   arrange(deletion_chr13,monosomy_trisomy_13, Translocation_13) %>% 
+#   select(USI,NUP98.Rearranged.Groups,Any_chr13_Deletion,  deletion_chr13) %>% 
+#   mutate_at(vars(deletion_chr13), ~ifelse(is.na(.),"None", .)) %>% 
+#   full_join(., all_KDM5A, by="USI") %>% 
+#   mutate_at(vars(deletion_chr13), ~case_when(
+#     is.na(.) & Reg. %in% nup.ineligable$Reg_NO ~ "Arm D Excluded for Clinical Analyses by COG",
+#     is.na(.) & ISCN == "Unknown" ~ "No Cyto",
+#     TRUE ~ .)) %>% 
+#   mutate(Has.RBD.RNAseq=ifelse(USI %in% manifest$USI, "Yes", "No"))
+
+
+# chr13.kdm5A
+
+# table(chr13.kdm5A$deletion_13_band_start)
+# table(chr13.kdm5A$deletion_13_band_end)
+
+# write.csv(chr13.kdm5A, "TARGET_AML_NUP98-KDM5A_del13q_annotation_v2.csv", row.names = F)
+```
+
+```{r}
+chr13.abn.matrix <- CDE_forAnalysis %>% 
+  filter(grepl("NUP98-KDM5A|Other", NUP98.Rearranged.Groups),
+         !grepl("Unknown", Any_chr13_Abnormality)) %>% 
+  group_by(NUP98.Rearranged.Groups,Any_chr13_Abnormality) %>% 
+  count() %>% 
+  ungroup() %>% 
+  pivot_wider(names_from=Any_chr13_Abnormality,
+              values_from=n) %>% 
+  column_to_rownames("NUP98.Rearranged.Groups") %>% 
+  as.matrix()
+
+addmargins(chr13.abn.matrix)
+
+# chisq.test(chr13.abn.matrix)
+fisher.test(chr13.abn.matrix, alternative = c("greater"))
+```
+
+### KM plots
+å
+```{r}
+df <- CDE_forAnalysis %>% 
+  select(Reg., NUP98.Rearranged.Groups, Any_chr13_Deletion, M7_AML, matches("_13|chr13|OS|EFS|Event")) %>% 
+  filter(!is.na(EFS.time..days.)) %>% 
+  mutate(NUP98.KDM5A_chr13=case_when(
+    grepl("KDM5A", NUP98.Rearranged.Groups) & Any_chr13_Deletion =="chr13_deletion" ~ "NUP98-KDM5A/del13q",
+    grepl("KDM5A", NUP98.Rearranged.Groups) & Any_chr13_Deletion =="None" ~ "NUP98-KDM5A",
+    grepl("NSD1|-X", NUP98.Rearranged.Groups) ~ NUP98.Rearranged.Groups,
+    grepl("OtherAML", NUP98.Rearranged.Groups) & Any_chr13_Deletion =="chr13_deletion" ~ "OtherAML/del13q",
+    TRUE ~ NUP98.Rearranged.Groups)) %>% 
+  mutate(NUP98.KDM5A_chr13_abn=case_when(
+    grepl("KDM5A", NUP98.Rearranged.Groups) & Any_chr13_Abnormality =="chr13_Abnormality" ~ "NUP98-KDM5A/13abn",
+    grepl("KDM5A", NUP98.Rearranged.Groups) & Any_chr13_Abnormality =="None" ~ "NUP98-KDM5A",
+    grepl("NSD1|-X", NUP98.Rearranged.Groups) ~ NUP98.Rearranged.Groups,
+    grepl("OtherAML", NUP98.Rearranged.Groups) & Any_chr13_Abnormality =="chr13_Abnormality" ~ "OtherAML/13abn",
+    TRUE ~ NUP98.Rearranged.Groups)) %>%
+  mutate(NUP98.KDM5A_chr13_AMKL=case_when(
+    M7_AML=="Yes" & !grepl("NSD1|-X",NUP98.KDM5A_chr13) ~ paste0("AMKL/",NUP98.KDM5A_chr13),
+    # M7_AML!="Yes" & !grepl("NSD1|-X",NUP98.KDM5A_chr13) ~ paste0("non-AMKL/", NUP98.KDM5A_chr13),
+    TRUE ~ NUP98.KDM5A_chr13)) %>% 
+  
+  
+  mutate_at(vars(NUP98.KDM5A_chr13_AMKL), ~gsub("OtherAML/", "", gsub("^OtherAML/del13q", "OtherAML/del13q", .))) %>%
+  filter(!grepl("-X|NSD1", NUP98.KDM5A_chr13)) %>% 
+  arrange(NUP98.Rearranged.Groups, Any_chr13_Deletion, EFS.event.type.ID, M7_AML)
+
+
+
+# table(df$NUP98.KDM5A_chr13)
+# table(df$NUP98.KDM5A_chr13_abn)
+# table(df$NUP98.KDM5A_chr13_AMKL)
+
+# df
+# write.csv(df, "TARGET_AML_NUP98-KDM5A_AMKL_del13q.csv", row.names = FALSE)
+```
+
+```{r fig.height=8, fig.width=17}
+colors_abn13 <- c("NUP98-KDM5A" = "magenta",
+                  "NUP98-KDM5A/del13q" = "mediumorchid4",
+                  "NUP98-KDM5A/13abn" = "mediumorchid4",
+                 "NUP98-NSD1" = "steelblue1",
+                 "NUP98-X" = "green1",
+                 "OtherAML" = "grey80",
+                 "OtherAML/del13q" = "darkslategray4",
+                 "OtherAML/13abn" = "darkslategray4",
+                 "NBM" = "gray80")
+
+# chr13_variable <- "NUP98.KDM5A_chr13" 
+chr13_variable <- "NUP98.KDM5A_chr13_abn"
+colors_abn13 <- colors_abn13[names(colors_abn13) %in% pull(df, chr13_variable)]
+
+  
+chr13_KM <- KM.plots(df = df,
+                     group_vars = NULL, 
+                     type = "OS", 
+                     covariate = chr13_variable,
+                     cohort = "1031", 
+                     cc = colors_abn13, 
+                     riskTable = TRUE)
+
+# pdf("Figures/TARGET_AML_NUP98-KDM5A_any_chr13_abnormality_KMplot_08.27.21.pdf", height = 8, width = 20)
+grid.arrange(grobs=c(chr13_KM$OS, chr13_KM$EFS), ncol=2)
+# dev.off()
+```
+
+
+
+```{r fig.height=12, fig.width=20}
+cc_B <- brewer.pal(7, "Set1") %>% 
+  set_names(unique(df$NUP98.KDM5A_chr13_AMKL))
+cc_B[["OtherAML/del13q"]] <- "black"
+cc_B[["OtherAML"]] <- "darkgrey"
+
+  
+chr13_AMKL_KM <- KM.plots(df = df,
+                      # group_vars = "NUP98.Rearranged.Groups", 
+                     type = "OS", 
+                     covariate = "NUP98.KDM5A_chr13_AMKL",
+                     cohort = "1031", 
+                     cc = cc_B)
+
+chr13_AMKL <- KM.plots(df = filter(df, NUP98.Rearranged.Groups=="OtherAML"),
+                      # group_vars = "NUP98.Rearranged.Groups",
+                     type = "OS",
+                     covariate = "NUP98.KDM5A_chr13_AMKL",
+                     cohort = "1031",
+                     cc = cc_B[grep("[Oo]therAML", names(cc_B))])
+
+# pdf("TARGET_AML_NUP98-KDM5A_del13q_AMKL_KMplot.pdf", height = 12, width = 20)
+grid.arrange(grobs=c(chr13_AMKL_KM$OS, chr13_AMKL_KM$EFS), ncol=2)
+# dev.off()
+
+# pdf("TARGET_AML_OtherAML_del13q_AMKL_KMplot.pdf", height = 12, width = 20)
+grid.arrange(grobs=c(chr13_AMKL$OS, chr13_AMKL$EFS), ncol=2)
+# dev.off()
+
+
+# grid.arrange(grobs=c( chr13_AMKL$OS, chr13_AMKL$EFS))
+```
+
+
+```{r}
+chr13.X <- filter(CDE_forAnalysis,
+                  NUP98.Rearranged.Groups=="NUP98-X", Any_chr13_Abnormality!="OtherAML" ) %>% 
+  arrange(deletion_chr13,monosomy_trisomy_13, translocation_13)
+
+# chr13.X
+# table(chr13.X$deletion_13_band_start)
+# table(chr13.X$deletion_13_band_end)
+```
+
+
+```{r warning=FALSE}
+kdm5a.chr13.dat <- CDE_forAnalysis %>%  #chr13
+  left_join(., select(manifest, USI, Tissue),
+            by="USI") %>% 
+  select(NUP98_Exons,matches("Any_chr13"),Tissue, one_of(cols)) %>% 
+  mutate_if(is.character, ~ifelse(.=="Unknown", NA, .)) %>% 
+  filter(grepl("KDM5A", NUP98.Rearranged.Groups)) 
+
+
+# colnames(kdm5a.chr13.dat)
+comparisons_kdm5a <- c("NUP98_Exons", "Any_chr13_Abnormality", "Any_chr13_Deletion")
+
+comp.kdm5a <- lapply(comparisons_kdm5a, 
+            function(var){
+            compareGroups(formula = formula(paste(var,"~ .")),
+                        data = kdm5a.chr13.dat,
+                        method = 4,
+                        max.ylev = 7,
+                        max.xlev = 10,
+                        Q1 = 0,
+                        Q3 = 1,
+                        ref = 1,
+                        p.corrected = TRUE,
+                        include.miss = FALSE)
+         }) 
+names(comp.kdm5a) <- comparisons_kdm5a
+
+
+# # dir.create("Chr13_Deletions/KDM5A/")
+# tab.kdm5a.exons  <- createTable(comp.kdm5a$NUP98_Exons, show.p.mul = T) %>% 
+#   export2csv(., "Chr13_Deletions/KDM5A/KDM5A_by_NUP98_Exon_Clinical_Table.csv")
+# 
+tab.kdm5a.abn13  <- createTable(comp.kdm5a$Any_chr13_Abnormality, show.p.mul = T) %>%
+  export2csv(., "Chr13_Deletions/KDM5A/KDM5A_by_chr13Abnormality_Clinical_Table_08.10.21.csv")
+# 
+# tab.kdm5a.del13  <- createTable(comp.kdm5a$Any_chr13_Deletion, show.p.mul = T) %>% 
+#   export2csv(., "Chr13_Deletions/KDM5A/KDM5A_by_chr13Deletion_Clinical_Table.csv")
+```
+
+
+```{r}
+test.df <- CDE_forAnalysis %>% 
+  select(NUP98.Rearranged.Groups, Any_chr13_Abnormality)
+
+comp.13 <- compareGroups(
+                        formula = NUP98.Rearranged.Groups ~ .,
+                        data = test.df,
+                        method = 4,
+                        max.ylev = 7,
+                        max.xlev = 10,
+                        Q1 = 0,
+                        Q3 = 1,
+                        ref = 1,
+                        p.corrected = TRUE,
+                        include.miss = FALSE)
+
+tab.13 <- createTable(comp.13, show.p.mul = T)
+tab.13
+# export2csv(tab.13,"TARGET_AML_chr13_Abnormalities_in_NUP98.csv")
+```
+
+
+## Chr13 Characteristics: OtherAML
+
+```{r}
+colNames <- read.csv("Tables/TARGET_AML_Clinical_Columns_for_Analysis.csv")
+# colNames
+```
+
+```{r}
+chr13.dat <- CDE_forAnalysis %>%  
+  filter(!is.na(ISCN), ISCN != "Unknown") %>% 
+  filter(!grepl("NUP98", NUP98.Rearranged.Groups)) %>% 
+  
+  
+  select(USI,Reg.,one_of(colNames$X), matches("ETS"),
+         Primary.Fusion) %>%
+  
+  group_by(Primary.Fusion) %>%
+  mutate(Fusion_Category=case_when(
+    Primary.Fusion == "None" ~ "OtherAML",
+    grepl("KMT2A", Primary.Fusion) ~ "KMT2A",
+    n() >= 20 ~ Primary.Fusion,
+    n() < 20 ~ "OtherAML")) %>%
+  ungroup() %>% 
+  
+  
+  left_join(., select(chr13, Reg.,
+                      deletion_chr13,monosomy_trisomy_13,
+                      Translocation_13,Any_chr13_Abnormality),
+            by="Reg.") %>%
+  mutate_at(vars(deletion_chr13), ~ifelse(is.na(.), "OtherAML", "del(13)")) %>%
+  mutate_at(vars(monosomy_trisomy_13), ~ifelse(is.na(.), "OtherAML", .)) %>%
+  mutate_at(vars(Translocation_13), ~ifelse(is.na(.), "OtherAML", "t(13;X)")) %>%
+  mutate_all(~ifelse(.=="Unknown", NA, .)) %>% 
+  
+  
+  select(USI,Reg.,deletion_chr13,monosomy_trisomy_13,
+         Translocation_13,Any_chr13_Abnormality, everything()) %>%
+  arrange(deletion_chr13, monosomy_trisomy_13, desc(Translocation_13)) 
+
+
+# head(chr13.dat)
+# write.csv(chr13.dat,"TARGET_AML_0531_1031_chr13_CDEs.csv", row.names = F)
+```
+
+```{r}
+table(chr13.dat$deletion_chr13, useNA = 'ifany')
+table(chr13.dat$Translocation_13)
+table(chr13.dat$monosomy_trisomy_13)
+# table(chr13.dat$Any_chr13_Abnormality)
+# # table(chr13.dat$Fusion_Category) 
+# table(chr13.dat$ETS_Fusion)
+```
+
+```{r warning=FALSE}
+explanatory.vars <- c("deletion_chr13",
+                    "monosomy_trisomy_13",
+                    "Translocation_13",
+                    "Any_chr13_Abnormality")
+comps.13 <- lapply(explanatory.vars, 
+          function(var){
+           compareGroups(formula = formula(paste(var,"~ .")),
+                        data = select(chr13.dat,-Reg.,-USI),
+                        method = 4,
+                        max.ylev = 7,
+                        max.xlev = 10,
+                        Q1 = 0,
+                        Q3 = 1,
+                        ref = 1,
+                        p.corrected = TRUE,
+                        include.miss = FALSE)
+         }) 
+
+tabs.13 <- lapply(comps.13, function(x) createTable(x, show.p.mul = T))
+names(tabs.13) <- explanatory.vars
+
+# lapply(explanatory.vars, function(x) export2csv(tabs.13[[x]],
+#                                                paste0("TARGET_AML_",x,"_Abnormalities_without_NUP98_Clinical_Table.csv")))
+
+
+```
+
+## Chr17 abnormalities
+
+3) NUP98-KDM5A with 17p abnormalities
+
+```{r}
+CDE_forAnalysis %>% 
+  filter(grepl("NUP98-KDM5A", NUP98.Rearranged.Groups)) %>% 
+  # filter(grepl("t\\(17;|t\\([0-9XY]{1,2};17|(ins|del).17", ISCN)) %>% 
+  filter(grepl("17", ISCN)) %>% 
+  select(USI,Reg., Any_chr13_Abnormality, ISCN) %>% 
+  View()
+```
+
+
+# Outcome by Exon Junction
+
+```{r}
+df_exons <- CDE_forAnalysis %>% 
+  select(Sample,USI, NUP98.Rearranged.Groups, NUP98_Exons, NUP98_Exon_Group, matches("EFS|OS|Event")) %>% 
+  filter(!is.na(NUP98_Exon_Group))
+
+table(df_exons$NUP98_Exon_Group, df_exons$NUP98.Rearranged.Groups)
+```
+NOTE: I am missing 1 exon 13 KDM5A patient compared to COGs data  and I am missing 1 exon 12 NSD1 patient
+
+
+```{r}
+exons_KDM5A_X <- df_exons %>% 
+  filter(grepl("KDM5A|-X", NUP98.Rearranged.Groups)) %>% 
+  mutate(NUP98_Exon_Group=case_when(
+    NUP98_Exons=="Exon13" ~ NUP98_Exons, 
+    NUP98_Exons=="Exon14" ~ NUP98_Exons, 
+    TRUE ~ "Others")) %>% 
+  arrange(NUP98.Rearranged.Groups) %>% 
+  select(USI, NUP98.Rearranged.Groups, NUP98_Exon_Group, 
+         OS.ID, OS.time..days.)
+
+# write.csv(exons_KDM5A_X,"COG/TARGET_AML_NUP98-KDM5A_NUP98-X_Outcome_by_Exon_02.01.2022.csv", row.names = FALSE)
+# table(exons_KDM5A_X$NUP98_Exons)
+# exons_KDM5A_X$OS.ID
+# table(exons_KDM5A_X$NUP98_Exon_Group)
+
+fit <- survival::survfit(survival::Surv(OS.time..days./365.25,OS.ID) ~ NUP98_Exon_Group, data= exons_KDM5A_X)
+diff <- survival::survdiff(survival::Surv(OS.time..days./365.25,OS.ID) ~ NUP98_Exon_Group, data= exons_KDM5A_X)
+combine_KDM5A_X_KM <- GGally::ggsurv(fit,
+                             plot.cens=TRUE, 
+                surv.col = c("Exon13"="#A6CEE3", "Exon14"="#B2DF8A", "Others"="grey"), 
+                CI=FALSE, 
+                lty.est = 1, 
+                size.est = 0.5,
+                cens.size = 0,
+                order.legend=FALSE) +
+  scale_y_continuous(labels=c("0","0.25", "0.5", "0.75", "1"), expand=c(0,0)) +
+  scale_x_continuous( expand=c(0,0), limits = c(0,14), breaks = seq(0,14,by=2)) +
+  labs(y="Overall Survival", x="Years from Study Entry") +
+  theme(panel.background = element_rect(fill=NA),
+        panel.grid = element_blank(),
+        text = element_text(color="black", size=12),
+        axis.line = element_line(), 
+        legend.position = "None")
+
+# pdf("TARGET_AML_NUP98-KDM5A_NUP98-X_Exon_KM_02.01.2022.pdf", height = 5, width=6.5)
+combine_KDM5A_X_KM
+# dev.off()
+```
+
+```{r}
+exons_table <- read.csv("TARGET_AML_NUP98_Exon_Table_forSupp_2.16.21.csv") %>% 
+  mutate(NUP98.Exon.Junctions.Identified=factor(NUP98.Exon.Junctions.Identified, levels=NUP98.Exon.Junctions.Identified)) 
+
+
+
+cc_exons <- cc_exons <- brewer.pal(10,"Paired")
+names(cc_exons) <- levels(exons_table$NUP98.Exon.Junctions.Identified)
+cc_exons[["Other_Exons"]] <- "black"
+cc_exons <- cc_exons[unique(df_exons$NUP98_Exon_Group)]
+cc_exons
+```
+
+```{r}
+fusions <- fusion <- unique(df_exons$NUP98.Rearranged.Groups)
+KM_exons <- lapply(1:3, function(i){
+  
+  fusion <- fusions[i]
+  input <- df_exons %>% 
+    filter(NUP98.Rearranged.Groups==fusion)
+  
+    KM.plots(df = input,
+                      group_vars = NULL,
+                     type = "OS", 
+                     covariate = "NUP98_Exon_Group",
+                     cohort = "1031", 
+                     cc = cc_exons[unique(input$NUP98_Exon_Group)])
+  
+})
+names(KM_exons) <- fusions
+```
+
+
+```{r fig.height=5, fig.width=10}
+# lapply(fusions, function(fusion) {
+#   km_res <- KM_exons[[fusion]]
+#   
+#   pdf(paste0("TARGET_AML_", fusion,"_by_NUP98_exons_08.27.21.pdf"), height=7, width=12)
+#   grid.arrange(grobs=c(  km_res$OS, km_res$EFS ), ncol=2)
+#   dev.off()
+# })
+```
+
+
+# NUP98-NSD1 Exons Characteristics
+
+```{r}
+library(compareGroups)
+```
+
+```{r warning=FALSE}
+nsd1.dat <- CDE_forAnalysis %>% 
+  left_join(., select(manifest, USI, Tissue),
+            by="USI") %>% 
+  select(NUP98_Exons,matches("Any_chr13"),Tissue, one_of(cols)) %>% 
+  filter(grepl("NSD1", NUP98.Rearranged.Groups),
+         grepl("Exon", NUP98_Exons)) %>% 
+  mutate_at(vars(NUP98_Exons),~case_when(
+    !grepl("Exon1[23]", .) ~ "Other_Exons",
+    TRUE ~ .))
+
+
+comp.nsd1 <-  compareGroups(formula = NUP98_Exons ~ .,
+                        data = nsd1.dat,
+                        method = 4,
+                        max.ylev = 7,
+                        max.xlev = 10,
+                        Q1 = 0,
+                        Q3 = 1,
+                        ref = 1,
+                        p.corrected = TRUE,
+                        include.miss = FALSE)
+
+
+
+tab.nsd1.exons  <- createTable(comp.nsd1, show.p.mul = T) 
+# export2csv(tab.nsd1.exons, "Tables/NSD1_by_NUP98_Exon_Clinical_Table.csv")
+```
+
+
+# NUP98-X Exons Enrichment
+
+```{r}
+temp <- CDE_forAnalysis %>% 
+  filter(NUP98.Rearranged.Groups=="NUP98-X") %>% 
+  mutate(HOX.partner=ifelse(grepl("HOX|PRRX1", NUP98.Rearranged), "Yes", "No")) 
+
+temp %>%  
+  group_by(HOX.partner, NUP98_Exons) %>% 
+  count()
+
+CDE_forAnalysis %>% 
+  filter(NUP98.Rearranged.Groups=="NUP98-X")
+```
+
+```{r}
+ # table(temp$NUP98_Exons)
+#Exon12 and Exon13 are the only ones with any level of recurrance
+# filter(temp, NUP98_Exons=="Exon13") %>% 
+#   select(USI,NUP98.Rearranged,NUP98_Exons, Age.in.years)
+# 
+# filter(temp, NUP98_Exons=="Exon12") %>% 
+#   select(USI,NUP98.Rearranged, NUP98_Exons, Age.in.years)
+```
+
+
+
+# BED File of Chr13 Abnormalities
+
+```{r}
+chr13_hits <- filter(chr13, Any_chr13_Abnormality == "chr13_Abnormality") %>% 
+  mutate(USI=ifelse(USI == "Unknown", Reg., USI)) %>% 
+  
+  #Add in monosomies and trisomies
+  mutate(monosomy_13_band_start=ifelse(monosomy_trisomy_13=="monosomy13","p13", NA),
+         monosomy_13_band_end=ifelse(monosomy_trisomy_13=="monosomy13", "q34", NA)) %>% 
+  mutate(trisomy_13_band_start=ifelse(monosomy_trisomy_13=="trisomy13","p13", NA),
+         trisomy_13_band_end=ifelse(monosomy_trisomy_13=="trisomy13", "q34", NA)) %>% 
+  
+  rowwise() %>% 
+  mutate(monosomy_13_start=get_locus(in_band = monosomy_13_band_start,
+                                     type = "start", 
+                                     cytobands = cytobands),
+         monosomy_13_end=get_locus(in_band = monosomy_13_band_end,
+                                   type = "end", 
+                                   cytobands = cytobands)) %>%
+    mutate(trisomy_13_start=get_locus(in_band = trisomy_13_band_start,
+                                     type = "start", 
+                                     cytobands = cytobands),
+         trisomy_13_end=get_locus(in_band = trisomy_13_band_end,
+                                   type = "end", 
+                                   cytobands = cytobands)) %>% 
+  ungroup() %>% 
+  
+  mutate(itemRGB=case_when(
+    grepl("KDM5A", NUP98.Rearranged.Groups) ~ paste(col2rgb("magenta"), collapse=","),
+    grepl("X", NUP98.Rearranged.Groups) ~ paste(col2rgb("green1"), collapse=","),
+    grepl("NSD1", NUP98.Rearranged.Groups) ~ paste(col2rgb("cornflowerblue"), collapse=","),
+    grepl("Other",NUP98.Rearranged.Groups) ~ paste(col2rgb("grey"), collapse=",")))  %>%
+  arrange(NUP98.Rearranged.Groups) %>% 
+
+  dplyr::select(USI,NUP98.Rearranged.Groups, itemRGB,
+         deletion_13_start,deletion_13_end,
+         translocation_13_start, translocation_13_end,
+         monosomy_13_start, monosomy_13_end,
+         trisomy_13_start,trisomy_13_end) 
+  
+  
+forBED <- chr13_hits %>% 
+  gather(type,position,-c(USI:itemRGB)) %>%
+  filter(!is.na(position))  %>%
+  separate(type,into = c("abnormality","type"), sep="_13_") %>%
+  spread(type, position) %>% 
+  mutate(ID=paste(USI,abnormality, sep="_")) %>% 
+  filter(!grepl("mono|tri", abnormality))
+
+
+# dim(chr13_hits) #49
+# View(chr13_hits)
+# chr13_hits
+```
+
+```{r}
+n <- nrow(forBED)
+bed <- data.frame(chrom=rep("chr13",n),
+                  chromStart=forBED$start,
+                  chromEnd=forBED$end,
+                  name=forBED$ID,
+                  score=rep(0,n),
+                  strand=rep(".", n),
+                  thickStart=forBED$start,
+                  thickEnd=forBED$end,
+                  itemRgb=forBED$itemRGB) 
+                  # blockCount=rep(0, n),
+                  # blockSizes=rep(0, n),
+                  # blockStarts=rep(".", n))
+
+# bed
+options(scipen=999)
+# trackList <- c(track name="Del(13) Abnormalities" description="deletions in Chr13 by Karyotype" visibility=2 itemRgb="On")
+# write.table(bed,"TARGET_AML_chr13_deletions_translocations.bed", quote=F, sep="\t", row.names=F, col.names=F)
+```
+
+
+
+## GVIZ
+
+```{r}
+suppressPackageStartupMessages(library(Gviz))
+```
+
+Resources:
+https://support.bioconductor.org/p/133785/
+https://support.bioconductor.org/p/p133015/
+https://www.bioconductor.org/packages/release/bioc/vignettes/GenomicRanges/inst/doc/GenomicRangesIntroduction.html
+https://www.bioconductor.org/packages/release/bioc/vignettes/rtracklayer/inst/doc/rtracklayer.pdf
+
+
+
+```{r eval=FALSE}
+#Example
+library(TxDb.Hsapiens.UCSC.hg19.knownGene)
+txdb <- TxDb.Hsapiens.UCSC.hg19.knownGene
+
+# GeneRegionTrack(txdb)
+chr6_track <- GeneRegionTrack(txdb, chromosome="chr6", start=35000000, end=36000000,
+                              collapseTranscripts=FALSE,
+                              geneSymbol=TRUE, 
+                              showId=TRUE)
+plotTracks(chr6_track)
+```
+
+```{r eval=FALSE}
+#Example 
+library(rtracklayer)
+session <- browserSession()
+genome(session) <- "hg38"
+gr <- GRanges("chr11", IRanges(from, to))
+z <- getTable(ucscTableQuery(session, track = "uniprot", table = "unipDomain", range = gr))
+ z
+
+makeSplit <- function(d.f){
+    splitsville <- lapply(strsplit(z$chromStarts, ","), as.numeric)
+    splitsville2 <- lapply(strsplit(z$blockSizes, ","), as.numeric)
+    splitsville <- mapply(function(x,y) x + y, splitsville, d.f[,2])
+    splitsville2 <- mapply(function(x,y) x + y, splitsville2, splitsville)
+    len <- length(unlist(splitsville))
+    thatstuff <- rep("exon_1", len)
+    gr <- GRanges(rep(d.f[1,1], len),
+                  IRanges(unlist(splitsville), unlist(splitsville2)),
+                  rep(z$strand, sapply(splitsville, length)),
+                  feature = thatstuff, id = thatstuff, exon = thatstuff,
+                  transcript = rep(paste0("transcript_", seq_len(length(splitsville))),
+                                   sapply(splitsville, length)),
+                  gene = rep(z$name, sapply(splitsville, length)),
+                  symbol = rep(z$name, sapply(splitsville, length)),
+                  density = rep(1, length(thatstuff)))
+    gr
+}
+
+domains2 <- GeneRegionTrack(makeSplit(z))
+plotTracks(list(itrack, gtrack, knownGenes, domains2), transcriptAnnotation = "gene" )
+```
+
+
+```{r message=F}
+IDmap <- read.csv(file.path(PROJHOME,"0000.00.02_Reference_GeneInfo/GeneSymbol_Ensembl_ID_Conversion_GRCh37.69_FromBCCA.csv"))
+head(IDmap)
+
+
+GRCh37 <- AnnotationDbi::loadDb(file.path(PROJHOME, "0000.00.02_Reference_GeneInfo/SQL/GRCh37-lite_Ensembl_v69_TxDB.sqlite"))
+seqlevels(GRCh37) <-  c("13") #subset to chr13 only
+# seqlevelsStyle(GRCh37) <- "UCSC"
+
+gene_ranges_GR <- genes(GRCh37)
+seqlevels(gene_ranges_GR) 
+```
+
+
+```{r}
+#I cant figure out where Item RGB goes in the GRanges object to actually export it properly. It has the functionality though.
+del13_subset <- chr13_hits %>% 
+  filter(grepl("NUP98",NUP98.Rearranged.Groups)) %>% 
+  filter(!is.na(deletion_13_start))
+
+start <- pull(del13_subset, deletion_13_start)
+end <- pull(del13_subset, deletion_13_end)
+del13.gr <- GenomicRanges::GRanges(seqnames = S4Vectors::Rle("13"),
+                                   ranges = IRanges::IRanges(start=start,
+                                                             end=end,
+                                                             names = pull(del13_subset, USI)),
+                                   strand="*",
+                                   mcols=del13_subset)
+
+# del13.gr #do I have to add 1 count here?
+# rtracklayer::export(del13.gr,"TARGET_AML_chr13_deletions.bed")
+```
+
+
+```{r}
+cytobands_gr <- GenomicRanges::GRanges(seqnames = S4Vectors::Rle("13"),
+                                   ranges = IRanges::IRanges(start=cytobands$chromStart,
+                                                             end=cytobands$chromEnd,
+                                                             names = pull(cytobands, name)),
+                                   strand="*",
+                                   mcols=cytobands)
+
+
+
+
+#Map the minimal region
+ord <- order(width(del13.gr)) #order so that the longest is at the end
+del13.list <- make_GRlist(GRanges_object=del13.gr[ord])
+intersection.coords <- Reduce(subsetByOverlaps, del13.list)
+# width(intersection.coords) #8,000,001
+
+#Map the cytobands that falls into minimal region
+cytobands_minimalRegion <- subsetByOverlaps(cytobands_gr, intersection.coords, minoverlap = 10)
+
+cytobands_minimalRegion
+```
+
+```{r}
+genes_in_del13 <- subsetByOverlaps(gene_ranges_GR,intersection.coords)
+# seqlevelsStyle(genes_in_del13) <- "UCSC"
+
+genes_del13_df <- genes_in_del13 %>% 
+  as.data.frame() %>% 
+  left_join(., IDmap, by="gene_id") %>% 
+  rename_at(vars(seqnames,gene_id,geneSymbol), ~c("chromosome","gene","symbol")) 
+  
+# genes_del13_df
+# head(genes_in_del13) #128 genes
+# write.csv(genes_del13_df,"Genes_in_del13_minimal_region.csv", row.names = F)
+```
+
+```{r}
+chr <- unique(seqlevels(del13.gr))
+uc_chr <- paste0("chr", chr)
+
+
+gtrack <- GenomeAxisTrack()
+itrack.1 <- IdeogramTrack(genome = "hg19", chromosome = uc_chr)
+
+seqlevelsStyle(del13.gr) <- "UCSC"
+del_trackA <- AnnotationTrack(del13.gr, 
+                              genome="hg19",
+                              stacking="squish",
+                              name="del13q Regions in NUP98 Fusions",
+                              id=del13.gr$mcols.NUP98.Rearranged.Groups)
+
+plotTracks(list(itrack.1, gtrack,del_trackA), collapse=FALSE)
+```
+
+```{r}
+Symbols <- IDmap$geneSymbol[match(genes_in_del13$gene_id, IDmap$gene_id)]
+genes_in_del13$Symbol <- Symbols
+genes_in_del13 <- genes_in_del13[order(genes_in_del13)]
+genes_in_del13["ENSG00000139687"]
+which(genes_in_del13$gene_id=="ENSG00000139687")
+```
+
+```{r fig.width=20, fig.height=7}
+# seqlevelsStyle(intersection.coords) <- "UCSC"
+# mindel_track <- AnnotationTrack(intersection.coords, genome="hg19",name="Minimally Deleted 13q Region")
+# grtrack <- GeneRegionTrack(genes_in_del13,
+#                            genome = "hg19",
+#                            chromosome = chr,
+#                            stacking="squish",
+#                            name = "Genes")
+
+options(ucscChromosomeNames=FALSE, ensembldb.seqnameNotFound=NA)
+# seqlevelsStyle(GRCh37) <- "UCSC"
+start_nearRB1 <- min(start(genes_in_del13[c(4:14)]))
+end_nearRB1 <- max(end(genes_in_del13[c(4:14)]))
+
+grTrack <- GeneRegionTrack(GRCh37, genome="hg19",
+                           chromosome = unique(seqlevels(GRCh37)),
+                           start = start(intersection.coords),
+                           end = end(intersection.coords), 
+                           showId=TRUE)
+
+plotTracks(list(grtrack), from = min(start_nearRB1), to=max(end_nearRB1))
+```
+
+
+
+
+```{r}
+## Which scheme is used?
+getOption("Gviz.scheme")
+
+## Change default settings for GeneRegionTrack
+scheme <- getScheme()
+scheme$GeneRegionTrack$fill <- "salmon"
+scheme$GeneRegionTrack$col <- NULL
+scheme$GeneRegionTrack$transcriptAnnotation <- "transcript"
+
+## replace default scheme with myScheme
+addScheme(scheme, "myScheme")
+options(Gviz.scheme="myScheme")
+getOption("Gviz.scheme")
+
+data(geneModels)
+grtrack <- GeneRegionTrack(geneModels, genome="hg19", chromosome="chr7", name="Gene Model")
+plotTracks(grtrack)
+```
+
+
+
+## WGS
+
+```{r}
+snvs <- xlsx::read.xlsx(file.path(TARGET,"DNA/WGS/analysis/2020.11.16_WGS_SNVs_Indels/AMLR_4deliver_v2_Nov24.xlsx"),
+                        sheetName = "SNVIndel")
+
+dim(snvs) #2203   23
+head(snvs)
+```
+
+```{r}
+LOH <- xlsx::read.xlsx(file.path(TARGET,"DNA/WGS/analysis/2020.11.16_WGS_SNVs_Indels/AMLR_4deliver_v2_Nov24.xlsx"),
+                        sheetName = "CNVLOH") #2 KDM5A, 2 NSD1, and 1 NUP-X
+
+dim(LOH)
+head(LOH)
+```
+
+```{r}
+has13del.iscn <- chr13 %>% 
+  filter(!is.na(deletion_chr13)) %>% 
+  select(USI,deletion_chr13, NUP98.Rearranged.Groups) 
+
+KDM5A.13del.iscn <- filter(has13del.iscn, NUP98.Rearranged.Groups=="NUP98-KDM5A")
+
+hasCNV.wgs <- LOH %>%
+  filter(USI %in% NUPs) %>% 
+  pull(USI) %>% 
+  unique()
+
+intersect(KDM5A.13del.iscn$USI, hasCNV.wgs) #"PAUVZD" "PAVAWS"(this one also found by DNAme, but not in WGS)
+
+filter(chr13_hits, grepl("PAUVZD|PAVAWS", USI))
+```
+
+```{r}
+LOH %>%
+  filter(USI %in% NUPs)  %>% 
+  filter(grepl("13", Chr))
+```
+
+
+```{r}
+filter(LOH, Chr==13) %>%  pull(USI) %>% unique() %>% length()
+
+LOH %>% 
+  left_join(.,select(chr13,USI,NUP98.Rearranged.Groups,deletion_chr13), by="USI" ) %>% 
+  filter(Chr==13) %>% 
+  arrange(NUP98.Rearranged.Groups, CallType..CNV.or.LOH.) %>% 
+  select(USI,NUP98.Rearranged.Groups, CallType..CNV.or.LOH.,deletion_chr13_byISCN=deletion_chr13, everything())
+```
+
+### SNV 
+
+```{r}
+SV <- xlsx::read.xlsx(file.path(TARGET,"DNA/WGS/analysis/2020.11.16_WGS_SNVs_Indels/AMLR_4deliver_v2_Nov24.xlsx"),
+                        sheetName = "SV")
+
+dim(SV)
+head(SV)
+```
+
+```{r}
+SV %>%
+  filter(USI %in% NUPs) %>% 
+  filter(grepl("13", ChrA) | grepl("13", ChrB))
+```
+
+
+### Germline
+
+```{r}
+germline <- xlsx::read.xlsx(file.path(TARGET,"DNA/WGS/analysis/2020.11.16_WGS_SNVs_Indels/AMLR_4deliver_v2_Nov24.xlsx"),
+                        sheetName = "Germline")
+
+dim(germline)
+```
+
+```{r}
+filter(CDE_forAnalysis, USI %in% snvs$USI) %>% 
+  group_by(NUP98.Rearranged.Groups) %>% 
+  summarize(N=n())
+
+filter(CDE_forAnalysis, USI %in% LOH$USI) %>% 
+  group_by(NUP98.Rearranged.Groups) %>% 
+  summarize(N=n()) #2KDM5A, 2NSD1, and 1X
+
+filter(CDE_forAnalysis, USI %in% SV$USI) %>% 
+  group_by(NUP98.Rearranged.Groups) %>% 
+  summarize(N=n()) #2 KDM5A, 2 NSD1, and 2X
+
+filter(CDE_forAnalysis, USI %in% germline$USI) %>% 
+  group_by(NUP98.Rearranged.Groups) %>% 
+  summarize(N=n())
+
+```
+
+
+
+
+#Kaplan-Meier Plots
+
+
+```{r}
+table(CDE_forAnalysis$NUP98.Rearranged.Groups)
+```
+
+```{r}
+outcome.df <- CDE_forAnalysis %>% 
+  filter(!is.na(OS.time..days.)) %>%
+  
+  mutate_at(vars(NUP98.Rearranged.Groups), 
+            ~gsub("OtherAML","AML_without_NUP98_rearrangement",.)) %>%
+  mutate_at(vars(NUP98.Rearranged.Groups), 
+            ~factor(., levels=unique(.))) %>%
+  
+  mutate(NUP98vsFinalRisk=case_when(
+          Final.Risk.Group == "Low" &
+            grepl("without", NUP98.Rearranged.Groups) ~ "Low Risk AML",
+          Final.Risk.Group == "High" &
+            grepl("without", NUP98.Rearranged.Groups) ~ "High Risk AML",
+          TRUE ~ as.character(NUP98.Rearranged.Groups)),
+        NUP98vsCMRisk=case_when(
+          Cyto.Fusion.Molecular.Risk == "Low" &
+            grepl("without", NUP98.Rearranged.Groups) ~ "Low Risk AML",
+          Cyto.Fusion.Molecular.Risk == "High" &
+            grepl("without", NUP98.Rearranged.Groups) ~ "High Risk AML",
+          Cyto.Fusion.Molecular.Risk == "Standard" &
+            grepl("without", NUP98.Rearranged.Groups) ~ "Standard Risk AML",
+          TRUE ~ as.character(NUP98.Rearranged.Groups))) %>% 
+   mutate(NUP98vsFinalRisk=factor(NUP98vsFinalRisk,
+                                  levels=c("Low Risk AML","High Risk AML",
+                                           "NUP98-NSD1","NUP98-KDM5A",
+                                           "NUP98-X")),
+          NUP98vsCMRisk=factor(NUP98vsCMRisk, 
+                               levels = c("Low Risk AML","High Risk AML",
+                                          "Standard Risk AML",
+                                          "NUP98-NSD1","NUP98-KDM5A",
+                                           "NUP98-X")))
+
+dim(outcome.df) #2230  145
+table(outcome.df$NUP98.Rearranged.Groups)
+levels(outcome.df$NUP98.Rearranged.Groups)
+```
+
+
+```{r}
+table(outcome.df$NUP98vsCMRisk, useNA = 'ifany')
+table(outcome.df$NUP98vsFinalRisk, useNA = 'ifany')
+# table(outcome.df$NUP98.Rearranged)
+```
+
+## X
+
+```{r}
+KM.X <- KM.plots(df = filter(outcome.df,
+                             grepl("AML|NUP98-X", NUP98.Rearranged.Groups)) %>% 
+                   droplevels(),
+                 group_vars = NULL,
+                        type = "OS",
+                        covariate = "NUP98.Rearranged.Groups", 
+                        cohort = "1031",
+                        riskTable = FALSE)
+
+# summary(KM.X$OS.cox[[1]])
+# summary(KM.X$EFS.cox[[1]]) #just checking cox model p-values and HR dont change due to the additional groups. they dont. everything is compared to reference 
+# KM.X$OS.diff[[1]] #this need to be individual pair-wise comparisons. 
+# calc_KMcurve_pvalues(KM.X$OS.diff[[1]])
+```
+
+## KDM5A 
+
+```{r}
+KM.KDM5A <- KM.plots(df = filter(outcome.df,
+                             grepl("AML|NUP98-KDM5A", NUP98.Rearranged.Groups)) %>% 
+                   droplevels(),
+                 group_vars = NULL,
+                        type = "OS",
+                        covariate = "NUP98.Rearranged.Groups", 
+                        cohort = "1031",
+                        riskTable = FALSE)
+
+# summary(KM.KDM5A$OS.cox[[1]])
+# summary(KM.KDM5A$EFS.cox[[1]]) #just checking cox model p-values and HR dont change due to the additional groups. they dont. everything is compared to reference 
+KM.KDM5A$OS.diff[[1]] #this need to be individual pair-wise comparisons.
+# calc_KMcurve_pvalues(KM.KDM5A$OS.diff[[1]])
+```
+
+## NSD1 
+
+```{r}
+KM.NSD1 <- KM.plots(df = filter(outcome.df,
+                             grepl("AML|NUP98-NSD1", NUP98.Rearranged.Groups)) %>% 
+                   droplevels(),
+                 group_vars = NULL,
+                        type = "OS",
+                        covariate = "NUP98.Rearranged.Groups", 
+                        cohort = "1031",
+                        riskTable = FALSE)
+
+# summary(KM.NSD1$OS.cox[[1]])
+# summary(KM.NSD1$EFS.cox[[1]]) #just checking cox model p-values and HR dont change due to the additional groups. they dont. everything is compared to reference 
+KM.NSD1$OS.diff[[1]] #this need to be individual pair-wise comparisons.
+# calc_KMcurve_pvalues(KM.NSD1$OS.diff[[1]])
+```
+
+
+## All NUPs
+
+```{r}
+KM.all <- KM.plots(df = outcome.df,group_vars = NULL,
+                        type = "OS",
+                        covariate = "NUP98.Rearranged.Groups", 
+                        cohort = "1031",
+                        riskTable = FALSE)
+```
+
+```{r fig.height=5, fid.width=20}
+# pdf("TARGET_AML_NUP98-Rearranged_OS_EFS_KM_7.15.20.pdf", height = 8, width = 16)
+grid.arrange(grobs=c(KM.all$OS, KM.all$EFS), ncol=2)
+# dev.off()
+```
+
+```{r}
+cox_table_os <- coxSummaryTable(coxph.res = KM.all$OS.cox[[1]])
+cox_table_os
+
+cox_table_efs <- coxSummaryTable(coxph.res = KM.all$EFS.cox[[1]])
+cox_table_efs
+```
+
+```{r}
+KM.ind <- ls(pattern="KM\\.[NKX]")
+KM.ind <- KM.ind[c(2,1,3)] #order 
+
+pvalues_os <- sapply(KM.ind, function(x) calc_KMcurve_pvalues(get(x)$OS.diff[[1]])) %>% 
+  set_names(KM.ind)
+pvalues_os
+
+pvalues_efs <- sapply(KM.ind, function(x) calc_KMcurve_pvalues(get(x)$EFS.diff[[1]])) %>%
+  set_names(KM.ind)
+pvalues_efs
+
+# KM.all$OS.fit[[1]]$strata #Order OK
+```
+
+```{r}
+temp <- filter(outcome.df, NUP98.Rearranged.Groups=="NUP98-X") 
+
+
+
+addmargins(table(temp$OS.event.ID))
+addmargins(table(temp$EFS.event.type.ID))
+```
+
+
+```{r}
+summ_table_OS <- outcome_table(fit=KM.all$OS.fit[[1]],pvalues = pvalues_os)
+summ_table_OS
+
+
+summ_table_EFS <- outcome_table(fit=KM.all$EFS.fit[[1]], pvalues = pvalues_efs)
+summ_table_EFS
+```
+
+```{r eval=FALSE}
+summ_tables <- ls(pattern="table_")
+summ_tables
+
+
+for(tab in summ_tables){
+  filename="TARGET_AML_NUP98.Rearranged_vs_OtherAML_Outcome_Summary_Tables.xlsx"
+  append <- ifelse(file.exists(filename), TRUE, FALSE)
+
+  # write.xlsx(as.data.frame(get(tab)),
+  #            filename,
+  #            append=append,
+  #            sheetName = tab,
+  #            col.names = TRUE,
+  #            row.names = FALSE)
+  rm(tab)
+}
+```
+
+
+
+## NUPs vs Risk Groups
+
+Compare NUP98-rearrangements to High/Low risk (final risk group) patients with out NUP98-rearrangements. 
+
+Compare NUP98-rearrangements to High/Standard/Low risk (Cyto.Fusion.molecular risk) patients with out NUP98-rearrangements. 
+
+```{r}
+KM.finalRG <- KM.plots(df = filter(outcome.df,
+                                   Final.Risk.Group != "Unknown"),
+                       group_vars = NULL,
+                        type = "OS",
+                        covariate = "NUP98vsFinalRisk", 
+                        cohort = "1031",
+                        riskTable = FALSE)
+
+
+```
+
+```{r fig.height=3, fig.width=7}
+# pdf("TARGET_AML_NUP98_vs_Final.Risk.Groups_KM_7.15.20.pdf",
+#     height = 7, width = 14)
+grid.arrange(grobs=c(KM.finalRG$OS, KM.finalRG$EFS), ncol=2)
+# dev.off()
+```
+ 
+ 
+```{r}
+KM.CMRG <- KM.plots(df = filter(outcome.df,
+                                Cyto.Fusion.Molecular.Risk != "Unknown"),
+                       group_vars = NULL,
+                        type = "OS",
+                        covariate = "NUP98vsCMRisk", 
+                        cohort = "1031",
+                        riskTable = FALSE)
+
+```
+
+```{r fig.height=7, fig.width=15}
+# pdf("TARGET_AML_NUP98_vs_Cyto.Fusion.Molecular.Risk_KM_7.15.20.pdf",
+    # height = 7, width = 14)
+grid.arrange(grobs=c(KM.CMRG$OS, KM.CMRG$EFS), ncol=2)
+# dev.off()
+```
+
+
+## NUP98-KDM5A / AMKL
+
+This was for Karen Chisholms paper 
+
+```{r}
+outcome.KDM5A <- outcome.df %>% 
+  filter(grepl("0531|1031", Protocol)) %>% #only these cohort for K. Chisholm 
+  mutate(NUP98.KDM5A=ifelse(NUP98.Rearranged == "NUP98-KDM5A", "Yes", "No")) %>%
+  mutate(M7_KDM5A_groups=case_when(
+      M7_AML == "Yes" & NUP98.KDM5A == "Yes" ~ "M7/NUP98-KDM5A",
+      M7_AML == "Yes" & NUP98.KDM5A == "No" ~ "M7/OtherAML",
+      M7_AML == "No" & NUP98.KDM5A == "Yes" ~ "OtherFAB/NUP98-KDM5A",
+      M7_AML == "No" & NUP98.KDM5A == "No" ~ "OtherFAB/OtherAML")) %>% 
+  mutate(M7_KDM5A_del13_groups=case_when(
+      Monosomy13_Del13q == "Yes" & M7_KDM5A_groups == "M7/NUP98-KDM5A" ~ "M7/NUP98-KDM5A/del13q",
+      Monosomy13_Del13q == "Yes" & M7_KDM5A_groups == "M7/OtherAML" ~ "M7/OtherAML/del13q",
+      Monosomy13_Del13q == "Yes" & M7_KDM5A_groups == "OtherFAB/NUP98-KDM5A" ~ "OtherFAB/NUP98-KDM5A/del13q",
+      Monosomy13_Del13q == "Yes" & M7_KDM5A_groups == "OtherFAB/OtherAML" ~ "OtherFAB/OtherAML/del13q",
+      Monosomy13_Del13q != "Unknown" ~ M7_KDM5A_groups))
+
+table(outcome.KDM5A$M7_KDM5A_groups, outcome.KDM5A$Protocol, useNA='ifany')
+table(outcome.KDM5A$M7_KDM5A_del13_groups, useNA='ifany')
+```
+
+```{r}
+del13_table <- outcome.KDM5A %>% 
+  filter(M7_AML != "Unknown", 
+         Monosomy13_Del13q != "Unknown") %>%
+  group_by(M7_AML, NUP98.KDM5A,Monosomy13_Del13q) %>% 
+  summarize(N=n()) %>% 
+  ungroup() %>% 
+  group_by(NUP98.KDM5A,M7_AML) %>% 
+  mutate(N_KDM5A_M7_Groups=sum(N),
+         Percent_KDM5A_M7_Groups=round(N/N_KDM5A_M7_Groups*100, 
+                                   digits = 2)) %>%
+  ungroup() %>% 
+  arrange(NUP98.KDM5A,M7_AML,Monosomy13_Del13q)
+
+
+
+# write.csv(del13_table, "TARGET_AML_NUP98-KDM5A_M7_Del13q_Mono13_Frequencies.csv", row.names = FALSE)
+```
+
+
+```{r}
+# check2 <- outcome.KDM5A %>% 
+#   filter(M7_AML != "Unknown", 
+#          Monosomy13_Del13q != "Unknown") %>% 
+#   select(Reg., USI, Protocol, M7_AML, NUP98.KDM5A,Monosomy13_Del13q, ISCN) %>% 
+#   write.csv(., "TARGET_AML_AAML0531_AAML1031_Del13q_Check.csv", row.names = FALSE)
+```
+
+```{r}
+M7.KDM5A.KM <- KM.plots(df=filter(outcome.KDM5A, 
+                                  !is.na(M7_KDM5A_groups)),
+                        group_vars = NULL,
+                        type = "OS",
+                        covariate = "M7_KDM5A_groups",
+                        cohort = "1031",
+                        riskTable = FALSE)
+```
+
+```{r fig.width=12}
+# pdf("TARGET_AML_NUP98-KDM5A_vs_AMKL_M7_KMplots.pdf", height = 6, width = 14)
+grid.arrange(grobs=c(M7.KDM5A.KM$OS, M7.KDM5A.KM$EFS), ncol=2)
+# dev.off()
+```
+
+```{r}
+M7.KDM5A.1031<- KM.plots(df=filter(outcome.KDM5A, 
+                                  !is.na(M7_KDM5A_groups), 
+                                  Protocol=="AAML1031"),
+                        group_vars = NULL,
+                        type = "OS",
+                        covariate = "M7_KDM5A_groups",
+                        cohort = "1031",
+                        riskTable = FALSE)
+```
+
+```{r fig.width=12}
+# pdf("TARGET_AML_NUP98-KDM5A_vs_AMKL_M7_AAML1031_KMplots.pdf", height = 6, width = 14)
+grid.arrange(grobs=c(M7.KDM5A.1031$OS, M7.KDM5A.1031$EFS), ncol=2)
+# dev.off()
+```
+
+```{r}
+# table(outcome.KDM5A$M7_KDM5A_del13_groups, useNA='ifany')
+df <- outcome.KDM5A %>% 
+  filter(!grepl("M7/NUP98-KDM5A$|M7/OtherAML/del13q$",M7_KDM5A_del13_groups), !is.na(M7_KDM5A_del13_groups))
+
+# table(df$M7_KDM5A_del13_groups, useNA = 'ifany') # need to remove groups with very small numbers
+
+M7.KDM5A.del13 <- KM.plots(df=df,
+                        group_vars = NULL,
+                        type = "OS",
+                        covariate = "M7_KDM5A_del13_groups",
+                        cohort = "1031",
+                        riskTable = FALSE)
+
+
+```
+
+
+```{r fig.width=14}
+# pdf("TARGET_AML_NUP98-KDM5A_vs_AMKL_M7_del13q_Combined_0531_1031_KMplots.pdf", height = 8, width = 18)
+grid.arrange(grobs=c(M7.KDM5A.del13$OS, M7.KDM5A.del13$EFS), ncol=2)
+# dev.off()
+```
+
+```{r}
+# table(outcome.KDM5A$M7_KDM5A_del13_groups, useNA='ifany')
+df <- outcome.KDM5A %>% 
+  filter(!grepl("M7/NUP98-KDM5A$|M7/OtherAML/del13q$",M7_KDM5A_del13_groups), !is.na(M7_KDM5A_del13_groups))
+
+# table(df$M7_KDM5A_del13_groups, useNA = 'ifany') # need to remove groups with very small numbers
+
+Del13q.KM <- KM.plots(df=filter(outcome.KDM5A, Monosomy13_Del13q != "Unknown"),
+                        group_vars = NULL,
+                        type = "OS",
+                        covariate = "Monosomy13_Del13q",
+                        cohort = "1031",
+                        riskTable = FALSE)
+```
+
+```{r fig.width=12}
+# pdf("TARGET_AML_Monosomy13_Del13q_Combined_0531_1031_KMplots.pdf", height = 6, width = 12)
+grid.arrange(grobs=c(Del13q.KM$OS, Del13q.KM$EFS), ncol=2)
+# dev.off()
+```
+
+OK.  Now we know where we are starting.  
+Now, can we look at
+1.   -13/del13q patients with and without M7
+2.  -13/del13q patients with and without NUP8/KDM5A?
+
+```{r}
+Del13q_M7.KM <- KM.plots(df=filter(outcome.KDM5A, Monosomy13_Del13q != "Unknown", 
+                                   M7_AML != "Unknown") %>% 
+                           mutate_at(vars(M7_AML),
+                                     ~ifelse(.=="Yes", "M7", "OtherFAB")),
+                        group_vars = "M7_AML",
+                        type = "OS",
+                        covariate = "Monosomy13_Del13q",
+                        cohort = "1031",
+                        riskTable = TRUE)
+```
+
+```{r fig.width=5, fig.height=7}
+# pdf("TARGET_AML_Monosomy13_Del13q_vs_M7_Combined_0531_1031_KMplots.pdf", height = 12, width = 12)
+grid.arrange(grobs=c(Del13q_M7.KM$OS, Del13q_M7.KM$EFS), ncol=2)
+# dev.off()
+```
+
+```{r}
+filter(outcome.KDM5A, Monosomy13_Del13q != "Unknown",
+                                NUP98.KDM5A != "Unknown") %>% 
+                              mutate_at(vars(NUP98.KDM5A), 
+                                        ifelse(.=="Yes", "NUP98-KDM5A", "OtherAML"))
+```
+
+
+```{r}
+Del13q_KDM5A.KM <- KM.plots(df=filter(outcome.KDM5A, Monosomy13_Del13q != "Unknown",
+                                NUP98.KDM5A != "Unknown") %>% 
+                              mutate_at(vars(NUP98.KDM5A), 
+                                        ~ifelse(.=="Yes", "NUP98-KDM5A", "OtherAML")),
+                        group_vars = "NUP98.KDM5A",
+                        type = "OS",
+                        covariate = "Monosomy13_Del13q",
+                        cohort = "1031",
+                        riskTable = FALSE)
+```
+
+
+```{r fig.width=5, fig.height=5}
+# pdf("TARGET_AML_Monosomy13_Del13q_vs_NUP98-KDM5A_Combined_0531_1031_KMplots.pdf", height = 12, width = 12)
+grid.arrange(grobs=c(Del13q_KDM5A.KM$OS, Del13q_KDM5A.KM$EFS), ncol=2)
+# dev.off()
+```
+
+
+#Competing Risks 
+
+http://www.sthda.com/english/wiki/survminer-0-3-0#visualizing-competing-risk-analysis
+https://www.nature.com/articles/1705727
+https://cran.r-project.org/web/packages/survival/vignettes/survival.pdf
+https://khrc.ucsf.edu/sites/g/files/tkssra2416/f/wysiwyg/va_stats_seminar_Scherzer_08May2017.pdf
+
+```{r}
+addmargins(table(CDE_forAnalysis$NUP98.Rearranged.Groups, CDE_forAnalysis$Treatment.Arm))
+```
+
+```{r}
+# install.packages("cmprsk")
+# install.packages("survminer")
+library(cmprsk)
+library(survminer)
+```
+
+
+```{r}
+RR_dat <- CDE_forAnalysis %>% 
+  select(Reg., USI, Protocol,
+         NUP98.Rearranged, NUP98.Rearranged.Groups, OS.event.ID, OS.ID, 
+         EFS.event.type.ID, Event.ID, OS.time..days., EFS.time..days.,
+         matches("^CR.", ignore.case = FALSE),
+         matches(".CR.", ignore.case = FALSE),
+         matches(".RR.", ignore.case = FALSE)) %>% 
+  filter(!is.na(EFS.time..days.)) %>%
+  mutate_if(is.character, ~ifelse(.=="Unknown", NA, .)) %>%
+  #RR is a cumulative incidence and competing risk regression
+  #primary event == relapse
+  #competing event == IF,death,death without remission
+  #censored == censored
+  mutate(RR.from.enrollment=case_when(
+    EFS.event.type.ID == "Relapse" ~ "Primary event", 
+    EFS.event.type.ID %in% c("Death without remission","Death") ~ "Competing event", #"Induction failure",
+    EFS.event.type.ID == "Censored" ~ "Censored")) %>% 
+  mutate(RR.from.enrollment=factor(RR.from.enrollment, levels=c("Censored","Primary event", "Competing event"))) 
+ 
+
+# head(RR_dat)
+dim(RR_dat)
+
+levels(RR_dat$RR.from.enrollment)
+table(RR_dat$RR.from.enrollment, RR_dat$EFS.event.type.ID, useNA='ifany')
+any(is.na(RR_dat$Reg.))
+# write.csv(RR_dat, "~/tmp/RR_data.csv", row.names = FALSE)
+```
+
+```{r}
+#we have data from 
+addmargins(table(RR_dat$NUP98.Rearranged.Groups, RR_dat$RR.from.CR..end.of.course.1..indicator))
+table(RR_dat$NUP98.Rearranged.Groups,RR_dat$RR.from.enrollment, RR_dat$EFS.event.type.ID, useNA='ifany')
+```
+
+```{r}
+cc <- c("dodgerblue4", "brown3", "darkgoldenrod3", "deepskyblue1") %>% 
+  set_names(c("OtherAML","NUP98-NSD1","NUP98-KDM5A","NUP98-X"))
+cc
+```
+
+```{r}
+cuminc_enrollment <- list()
+for (i in 1:3){
+  Group=c("NUP98-KDM5A","NUP98-NSD1","NUP98-X")[i]
+  df1 <- filter(RR_dat, NUP98.Rearranged.Groups==Group |
+                              NUP98.Rearranged.Groups=="OtherAML") %>% 
+    mutate(NUP98.Rearranged.Groups=factor(NUP98.Rearranged.Groups,
+                                          levels=c("OtherAML",Group)))
+  
+  
+  print(addmargins(table(df1$NUP98.Rearranged.Groups, df1$RR.from.enrollment)))
+  
+  #using the nature pub group article with cmprsk package
+  cumIncidence=cuminc(ftime=df1$EFS.time..days./365.25, 
+                           fstatus=df1$RR.from.enrollment,
+                           group=df1$NUP98.Rearranged.Groups,
+                           rho=0,
+                           cencode = "Censored")
+  cuminc_enrollment[[Group]] <- cumIncidence
+  rm(df1,cumIncidence)
+}
+```
+
+```{r}
+cuminc_enrollment$`NUP98-KDM5A`$Tests
+cuminc_enrollment$`NUP98-NSD1`$Tests
+cuminc_enrollment$`NUP98-X`$Tests
+```
+
+```{r}
+# as.data.frame(cuminc_enrollment$`NUP98-KDM5A`$`OtherAML Primary event`) %>% tail()
+# as.data.frame(cuminc_enrollment$`NUP98-NSD1`$`OtherAML Primary event`) %>% tail()
+
+identical(as.data.frame(cuminc_enrollment$`NUP98-KDM5A`$`OtherAML Primary event`), 
+          as.data.frame(cuminc_enrollment$`NUP98-NSD1`$`OtherAML Primary event`))
+```
+
+```{r fig.width=10, fig.height=4}
+cuminc_combined_df <- tibble(Group="OtherAML",
+                 as.data.frame(cuminc_enrollment$`NUP98-KDM5A`$`OtherAML Primary event`)) %>% 
+    bind_rows(tibble(Group="NUP98-NSD1", pval="p = 0.001",
+                 as.data.frame(cuminc_enrollment$`NUP98-NSD1`$`NUP98-NSD1 Primary event`)), 
+              tibble(Group="NUP98-KDM5A", pval="p = 0.003",
+                     as.data.frame(cuminc_enrollment$`NUP98-KDM5A`$`NUP98-KDM5A Primary event`)),
+              tibble(Group="NUP98-X", pval="p = 0.34",
+                     as.data.frame(cuminc_enrollment$`NUP98-X`$`NUP98-X Primary event`))) %>% 
+  as.data.frame()
+
+  
+
+cuminc_enr_plots <- list()   
+for(i in 1:3){
+  fusion <- c("NUP98-KDM5A","NUP98-NSD1","NUP98-X")[i]
+  df1 <- cuminc_combined_df %>% filter(Group==fusion | Group=="OtherAML") 
+  # print(addmargins(table(df1$Group)))
+  
+  pvalue <- unique(df1$pval)
+  p <- ggplot(data = df1, mapping = aes(x=time, y=est, fill=Group, color=Group)) +
+        geom_line(size=1.25) +
+        scale_y_continuous(limits = c(0,1.0))+
+        scale_x_continuous(limits = c(0,9.0), breaks = seq(0,8,by=1))+
+        labs(x="Time (years)", y="Probability",
+                               title=paste0("NUP98-Rearranged Relapse Risk")) +
+         scale_color_manual(values=cc) +
+         annotate(geom="text",  x=1,y=0.8, label=pvalue, size=8) +
+        guides(color=guide_legend(override.aes = list(size=2))) +
+
+         theme_classic() +
+         theme(plot.title = element_text(size=24),
+               axis.title = element_text(size=24),
+               axis.text = element_text(size=20, color="black"),
+               legend.text = element_text(size=20),
+               legend.title = element_text(size=20),
+               legend.position = 'top')
+
+  cuminc_enr_plots[[fusion]] <- p
+  rm(df1,p,pvalue)
+}
+   
+
+ 
+grid.arrange(grobs=cuminc_enr_plots, ncol=3)
+ggsave(plot = grid.arrange(grobs=cuminc_enr_plots, ncol=3),
+       filename = "TARGET_AML_NUP98-Rearranged_RelapseRisk_fromEnrollment.pdf", device = "pdf",
+       height = 7, width = 20.5)
+```
+
+```{r}
+ggcompetingrisks(cuminc_enrollment$`NUP98-NSD1`,
+                 palette = "Dark2",
+                 legend = "top",
+                 multiple_panels=FALSE,
+                 ggtheme = theme_classic())
+```
+
+
+```{r}
+cuminc_CR2 <- list()
+for (i in 1:3){
+  Group=c("NUP98-KDM5A","NUP98-NSD1","NUP98-X")[i]
+  df1 <- filter(RR_dat, NUP98.Rearranged.Groups==Group |
+                              NUP98.Rearranged.Groups=="OtherAML") %>% 
+    mutate(NUP98.Rearranged.Groups=factor(NUP98.Rearranged.Groups,
+                                          levels=c("OtherAML",Group)))
+  
+  
+  print(addmargins(table(df1$NUP98.Rearranged.Groups, df1$RR.from.CR..end.of.course.1..indicator)))
+    
+  #using the Nature article with cmprsk package
+  #cumulative incidence function is used for survival curves, while relapse risk regression is for regression modeling with potential for multi-variable analyses and produces Sub-distribution hazard ratio
+  cumIncidence=cuminc(ftime=df1$Days.to.RR.from.CR..end.of.induction.2./365.25, 
+                           fstatus=df1$RR.from.CR..end.of.induction.2..indicator,
+                           group=df1$NUP98.Rearranged.Groups,
+                           rho=0,
+                           cencode = "Censored")
+  cuminc_CR2[[Group]] <- cumIncidence
+  rm(df1,cumIncidence,Group)
+}
+```
+
+
+```{r}
+cuminc_CR2$`NUP98-KDM5A`$Tests
+cuminc_CR2$`NUP98-NSD1`$Tests
+cuminc_CR2$`NUP98-X`$Tests
+```
+
+
+```{r fig.width=10, fig.height=4}
+cuminc_CRcombined_df <- tibble(Group="OtherAML",
+                 as.data.frame(cuminc_CR2$`NUP98-KDM5A`$`OtherAML Primary event`)) %>% 
+    bind_rows(tibble(Group="NUP98-NSD1",  pval="p = 0.06", 
+                 as.data.frame(cuminc_CR2$`NUP98-NSD1`$`NUP98-NSD1 Primary event`)), 
+              tibble(Group="NUP98-KDM5A",pval="p = 0.43",
+                     as.data.frame(cuminc_CR2$`NUP98-KDM5A`$`NUP98-KDM5A Primary event`)),
+              tibble(Group="NUP98-X", pval="p = 0.31",
+                     as.data.frame(cuminc_CR2$`NUP98-X`$`NUP98-X Primary event`))) %>% 
+  as.data.frame()
+
+  
+
+cuminc_CR_plots <- list()   
+for(i in 1:3){
+  fusion <- c("NUP98-KDM5A","NUP98-NSD1","NUP98-X")[i]
+  df1 <- cuminc_CRcombined_df %>% filter(Group==fusion | Group=="OtherAML") 
+  # print(addmargins(table(df1$Group)))
+  
+  pvalue <- unique(df1$pval)
+  p <- ggplot(data = df1, mapping = aes(x=time, y=est, fill=Group, color=Group)) +
+        geom_line(size=1.25) +
+        scale_y_continuous(limits = c(0,1.0))+
+        scale_x_continuous(limits = c(0,9.0), breaks = seq(0,8,by=1))+
+        labs(x="Time (years)", y="Probability",
+                               title=paste0("NUP98-Rearranged Relapse Risk")) +
+         scale_color_manual(values=cc) +
+         annotate(geom="text",  x=0.75,y=0.8, label=pvalue, size=8) +
+        guides(color=guide_legend(override.aes = list(size=2))) +
+
+         theme_classic() +
+         theme(plot.title = element_text(size=24),
+               axis.title = element_text(size=24),
+               axis.text = element_text(size=20, color="black"),
+               legend.text = element_text(size=20),
+               legend.title = element_text(size=20),
+               legend.position = 'top')
+
+  cuminc_CR_plots[[fusion]] <- p
+  rm(df1,p,pvalue)
+}
+   
+
+ # cuminc_CR_plots
+grid.arrange(grobs=cuminc_CR_plots, ncol=3)
+# ggsave(plot = grid.arrange(grobs=cuminc_CR_plots, ncol=3),
+#        filename = "TARGET_AML_NUP98-Rearranged_RelapseRisk_afterCR2.pdf", device = "pdf",
+#        height = 7, width = 20)
+
+
+```
+
+```{r}
+getwd()
+```
+
+
+
+```{r}
+  #using the Nature article with cmprsk package
+  #cumulative incidence function is used for survival curves, while relapse risk regression is for regression modeling with potential for multi-variable analyses and produces Sub-distribution hazard ratio
+KDM5A.compRiskReg=crr(ftime = RR_dat$Event.Free.Survival.Time.in.Days, 
+                  fstatus= .$First.Event,
+                  cov1 = matrix(.$Num.GO.Treatment, dimnames = list(NULL,"GO.Trt")), 
+                  failcode = "Relapse", 
+                  cengroup = "Censored")
+```
+
+
+# NUP98-X by Karyotype
+
+```{r}
+
+```
+
+
+
+# Discrepancies in ISCN vs Binary Columns
+
+
+Eline found that the number of trisomy 8 reported by COG was different than ours. 
+
+I see that there are potentially 40-50 patients for whom trisomy8/trisomy21 are present in the ISCN but listed as "No" in the columns by COG. 
+
+
+```{r}
+filter(CDE_forAnalysis, NUP98.Rearranged.Groups=="NUP98-X") %>% 
+  filter(grepl("trisomy8", Primary.CNV)) %>% 
+  select(USI, Protocol, Primary.Fusion, Primary.CNV, matches("trisomy"), ISCN)
+```
+
+
+```{r}
+filter(CDE_forAnalysis, trisomy.8=="No" | trisomy.21 == "No") %>% 
+  select(USI, Protocol, Primary.Fusion, Primary.CNV, matches("trisomy"), ISCN) %>% 
+  filter(grepl("trisomy8|trisomy21", Primary.CNV)) %>% 
+  filter(!(Primary.CNV=="trisomy8" & trisomy.8 == "Yes")) %>% 
+  filter(!(Primary.CNV=="trisomy21" & trisomy.21 == "Yes")) %>% 
+  arrange(desc(trisomy.8))
+
+```
+
+
+
+
+# Oncoprint
+
+```{r}
+suppressPackageStartupMessages(library(ComplexHeatmap))
+library(RColorBrewer)
+```
+
+```{r}
+binarize <-  function(mat, CDEs, Colnames){
+  for(i in 1:nrow(mat)){
+    gene <- rownames(mat)[i]
+    col <- Colnames[i]
+    binarized <- sapply(CDEs[[col]], function(g)  ifelse(g=="Yes",1,0))
+    mat[gene,] <- binarized
+  }
+  return(mat)
+}
+```
+
+
+### Order and Reformat Data
+
+```{r}
+dat <- dat %>% 
+  #Create an order
+  group_by(NUP98.Rearranged.Groups) %>% 
+  arrange(NUP98.Rearranged.Groups, 
+          
+          desc(FLT3.ITD.positive.), 
+          desc(WT1.mutation.),
+          desc(Del5q),
+          desc(Trisomy8),
+          desc(Abnormality13),
+          desc(Trisomy21), 
+          `Age Category`)  %>% 
+  ungroup()
+          # desc(NPM.mutation.),
+          # desc(c.Kit.Mutation),
+          # desc(CBL.Mutation)) %>% 
+  
+
+dim(dat)
+
+genes <- c("NUP98-R", 
+           "FLT3-ITD","WT1","NPM1","CEBPA", "cKIT", "CBL", 
+           "Monosomy7", "Del5q", "Abnormality13","Trisomy8", "Trisomy21")
+           # "KMT2A-R", "RUNX1-RUNX1T1","CBFB-MYH11","RBM15-MKL1","CBFA2T3-GLIS2"
+
+
+names(genes) <- c("NUP98.Rearranged.Groups",
+                  "FLT3.ITD.positive.", "WT1.mutation.", "NPM.mutation.", "CEBPA.mutation.", "c.Kit.Mutation","CBL.Mutation",
+                  "Monosomy7", "Del5q", "Abnormality13","Trisomy8", "Trisomy21")
+                  # "KMT2Ar","RUNX1.RUNX1T1", "CBFB.MYH11","RBM15.MKL1","CBFA2T3.GLIS2" #"RAS.Mutation",
+
+# genes
+length(genes) #12 rows
+
+gene_order <- c("NUP98.Rearranged.Groups",
+                  "FLT3.ITD.positive.", "WT1.mutation.", "NPM.mutation.", "CEBPA.mutation.", "c.Kit.Mutation","CBL.Mutation",
+                  "Abnormality13","Trisomy8", "Trisomy21",  "Del5q", "Monosomy7")
+genes <- genes[gene_order]
+dimnames=list(genes,dat$Reg.)
+
+
+alter_list <- list(NSD1=matrix(0, ncol=nrow(dat),nrow=length(genes), 
+                                   dimnames = dimnames),
+                   KDM5A=matrix(0, ncol=nrow(dat),nrow=length(genes), 
+                                   dimnames = dimnames),
+                   X=matrix(0, ncol=nrow(dat),nrow=length(genes), 
+                                   dimnames = dimnames),
+                   
+                   # fusion=matrix(ncol=nrow(dat),nrow=length(genes), 
+                   #                 dimnames = dimnames),
+                   mutation=matrix(ncol=nrow(dat),nrow=length(genes), 
+                                   dimnames = dimnames),
+                   cnv=matrix(ncol=nrow(dat),nrow=length(genes),
+                                        dimnames=dimnames))
+
+
+types <- list("Mutations"=c("FLT3-ITD","WT1","NPM1","CEBPA", "cKIT", "CBL"),
+              # "Fusions"=c("KMT2A-R", "RUNX1-RUNX1T1","CBFB-MYH11","RBM15-MKL1", "CBFA2T3-GLIS2"),
+              "CNVs"=c("Monosomy7", "Del5q", "Abnormality13","Trisomy8", "Trisomy21"))
+
+
+# alter_list$fusion <- binarize(mat = alter_list$fusion, CDEs=dat, Colnames=names(genes))
+# alter_list$fusion[c(types$Mutations, types$CNVs),] <- 0
+
+alter_list$mutation <- binarize(mat = alter_list$mutation, CDEs=dat, Colnames=names(genes))
+alter_list$mutation[c(types$CNVs,types$Fusions),] <- 0
+
+alter_list$cnv <- binarize(mat = alter_list$cnv, CDEs=dat, Colnames=names(genes))
+alter_list$cnv[c(types$Mutations, types$Fusions),] <- 0
+
+alter_list$NSD1["NUP98-R",] <- ifelse(dat[["NUP98.Rearranged.Groups"]] == "NUP98-NSD1", 1,0)
+alter_list$KDM5A["NUP98-R",] <- ifelse(dat[["NUP98.Rearranged.Groups"]] == "NUP98-KDM5A", 1,0)
+alter_list$X["NUP98-R",] <- ifelse(dat[["NUP98.Rearranged.Groups"]] == "NUP98-X", 1,0)
+
+# lapply(alter_list, head)
+# apply(alter_list$mutation,1,table, useNA='ifany')
+# apply(alter_list$fusion,1,table, useNA='ifany')
+# apply(alter_list$cnv,1,table, useNA='ifany')
+
+# apply(alter_list$NSD1,1,table, useNA='ifany')
+# apply(alter_list$KDM5A,1,table, useNA='ifany')
+# apply(alter_list$X,1,table, useNA='ifany')
+
+colors = c(
+        mutation = "dodgerblue4",
+        cnv="dodgerblue3",
+        # fusion="dodgerblue1",
+        NSD1 = "cornflowerblue", 
+        KDM5A= "magenta",
+        X= "green1")
+        # NSD1 = "#DEEBF7", 
+        # KDM5A= "#9ECAE1",
+        # X= "#3182BD")
+colors
+
+# barplot(rep(1,3), col=RColorBrewer::brewer.pal(3,"Blues")
+# brewer.pal(3,"Blues")
+
+# table(dat$`Age Category`)
+# ageColors <- c(
+#   Infant="darkviolet", # can stay the same
+#   Child="darkred", # could be 3-10
+#   AYA="darkorange", # could be over 10
+#   Adults="gray15",
+#   Elderly="gray60"
+# )
+
+annoColors <- list("Age Category"=c("Less than 3 years"="darkviolet",
+                    "Between 3 and 10 years"="darkred",
+                    "Greater than 10 years"="darkorange",
+                    "Unknown"="grey80"),
+                   "FAB"=c("M7"="tomato4",
+                           "M6"="tomato3",
+                           "Other FAB"="bisque1", 
+                           "Unknown"="grey75"))
+        # "M7_AML"=c("Yes"="slateblue4", "No"="slateblue1", "Unknown"="grey80"),
+        # "M6_AML"=c("Yes"="skyblue3", "No"="skyblue", "Unknown"="grey80"))
+
+
+linewidth=1
+bar_param <- default_axis_param("column")
+bar_param$gp$fontsize <- 16
+
+row_bar_param <- default_axis_param("row")
+
+row_bar_param$gp$fontsize <- 18
+#Heatmap annotations
+HA_samples <- HeatmapAnnotation(
+  which = "column",
+  cbar = anno_oncoprint_barplot(axis_param=bar_param),
+  df=as.data.frame(select(dat,`Age Category`, FAB)),
+  name="NUP98-R Oncoprint",
+  col=annoColors,
+  gap=unit(2,"mm"),
+  simple_anno_size = unit(1.25, "cm"),
+  annotation_name_gp = gpar(fontsize=20),
+  annotation_legend_param=list(title_gp=gpar(fontsize = 18),
+                               labels_gp=gpar(fontsize=14)))
+ 
+
+dummy_cats <- unlist(sapply(1:length(types), function(i){
+  category <- paste0(rep(" ", i), collapse="")
+  n <- length(types[[i]])
+  rep(category, n)
+}))
+
+splits.df <- data.frame(Gene=genes) %>%
+  mutate(Type=c("", dummy_cats)) %>%
+  select(Type)
+
+# splits.df
+column_splits <- data.frame(dat$NUP98.Rearranged.Groups)
+```
+
+## Run Oncoprint 
+
+```{r fig.height=7, fig.width=16}
+#Oncoprint
+op <- oncoPrint(mat=alter_list, 
+          alter_fun = list( 
+            background = function(x, y, w, h) 
+              grid.rect(x, y, w, h,
+                        gp = gpar(fill = "grey90",
+                                  col="white",
+                                  lwd=linewidth)),
+                mutation = function(x, y, w, h) 
+                    grid.rect(x, y, w, h, 
+                      gp = gpar(fill = colors["mutation"],
+                                col = "white",
+                                lwd=linewidth)),
+                fusion = function(x, y, w, h) 
+                    grid.rect(x, y, w, h, 
+                      gp = gpar(fill = colors["fusion"],
+                                col = "white",
+                                lwd=linewidth)),
+                cnv = function(x, y, w, h) 
+                    grid.rect(x, y, w, h, 
+                      gp = gpar(fill = colors["cnv"],
+                                col = "white",
+                                lwd=linewidth)),
+                 NSD1 = function(x, y, w, h) 
+                    grid.rect(x, y, w, h, 
+                      gp = gpar(fill = colors["NSD1"],
+                                col = "white",
+                                lwd=linewidth)), 
+                 KDM5A = function(x, y, w, h) 
+                    grid.rect(x, y, w, h, 
+                      gp = gpar(fill = colors["KDM5A"], 
+                                col = "white",
+                                lwd=linewidth)),
+                 X = function(x, y, w, h) 
+                    grid.rect(x, y, w, h, 
+                      gp = gpar(fill = colors["X"],
+                                col = "white",
+                                lwd=linewidth))),
+    col = colors,
+    top_annotation = HA_samples,
+    right_annotation = rowAnnotation(rbar = anno_oncoprint_barplot(axis_param = row_bar_param)),
+
+    left_annotation = rowAnnotation(split = anno_block(
+        gp = gpar(fill = c("white","dodgerblue4","dodgerblue3"),
+                  col=NA),
+        labels = c("", "Mutations","CNV"),
+        labels_gp = gpar(col = "white", fontsize = 24, fontface="bold"))),
+    row_split = splits.df,
+    column_split = column_splits, 
+
+    gap=unit(4.0,"mm"),
+    column_order = 1:ncol(alter_list$NSD1),
+    row_order = 1:nrow(alter_list$mutation),
+
+    row_names_gp=gpar(col="black",
+                      fontsize=24,
+                      fontface="bold"),
+    pct_gp = gpar(fontsize = 24))
+
+
+
+# pdf("Figures/TARGET_AML_Oncoprint_splitByFusionMutation_06.21.21.pdf", height=10, width=22)
+op
+# dev.off()
+
+# saveRDS(list(op,HA_samples,linewidth,col),"TARGET_AML_CEBPA_Oncoprint.RDS")
+```
+
+
+
+#Sequencing Data Availability
+
+```{r}
+data_matrix <- read.csv(file.path(TARGET,"SequencingDataMatrix","archive",
+                                  "TARGET_AML_0531_1031_SeqDataAvailability_3.29.18.csv")) %>% 
+  select(USI,matches("WGS|TCS"))
+
+head(data_matrix)
+dim(data_matrix)
+```
+
+```{r}
+DNAme.manifest <- read.csv(file.path(TARGET,"SequencingDataMatrix","TARGET_AML_EPICarray_manifest_2019.csv"))
+
+dim(DNAme.manifest)
+head(DNAme.manifest)
+sum(is.na(DNAme.manifest$RegNo))
+```
+
+```{r}
+# dir(file.path(TARGET,"SequencingDataMatrix"))
+manifest <- read.csv(file.path(TARGET,"SequencingDataMatrix","TARGET_AML_RBD_0531_1031_miRNAseq_mRNAseq_Manifest_v5.csv")) #%>% 
+  # filter(Replicate != "Replicate") %>% 
+  # filter(!duplicated(USI)) %>%
+  # select(USI,Final_Patient_ID,
+  #                     RBD.RNAseq=mRNAseq_coverage.transcript.normalized,
+  #                     miRNAseq=miRBase_v21)
+
+dim(manifest)
+```
+
+```{r}
+NUP98.Only <- merged %>% 
+  filter(NUP98.Rearranged != "OtherAML")
+
+sum(table(NUP98.Only$NUP98.Rearranged, useNA = 'ifany'))
+dim(NUP98.Only)
+```
+
+```{r}
+byStudy <- NUP98.Only %>%
+  group_by(Protocol) %>% 
+  dplyr::summarise(N=dplyr::n())
+
+byStudy
+sum(byStudy$N)
+```
+
+```{r}
+Nup.SeqData <- NUP98.Only %>% 
+  left_join(., manifest,
+            by="USI") %>% 
+  mutate(DNAme=ifelse(Reg. %in% DNAme.manifest$RegNo,1,0))
+
+dim(Nup.SeqData)
+```
+
+```{r}
+table(Nup.SeqData$RBD.RNAseq, useNA = 'ifany')
+table(Nup.SeqData$miRNAseq,useNA = 'ifany')
+table(Nup.SeqData$DNAme,useNA = 'ifany')
+```
+
+
+# NUP98 Patients with KMT2A
+
+```{r}
+#readr::read_csv is cause HUGE parsing errors in reading in the fusion file. 
+fusion_calls <- read.csv(file.path(PROJHOME, "2018.09.11_Combine_Fusion_Calls/Combined/TARGET_AML_0531_1031_Relapse_Combined_STAR_TransAbyss_CICERO_FusionCalls.csv"))
+
+dim(fusion_calls) #178,667    147
+```
+
+```{r} 
+kmt2a <- CDE_forAnalysis %>% 
+  filter(NUP98.Rearranged.Groups != "OtherAML" & 
+           (grepl("KMT2A", Primary.Fusion) | grepl("KMT2A", Additional.Fusions.CNV))) %>% 
+  mutate() %>% 
+  select(USI,Reg.,Protocol, ISCN,
+         MLL, Primary.Fusion, Additional.Fusions.CNV, Cyto.vs..Seq)
+
+
+kmt2a
+# write.csv(kmt2a,"TARGET_AML_KMT2A-NUP98_Patients.csv", row.names=FALSE)
+
+
+```
+
+```{r}
+kmt2a_rna.seq_fusions <- fusion_calls %>% 
+  filter(USI %in% kmt2a$USI) %>% 
+  group_by(Patient)%>% 
+  mutate(N=n()) %>% 
+  
+  mutate(KMT2A_evidence=ifelse(any(grepl("KMT2A", All_Fusions_Called)), 
+                               "Yes", "No")) %>% 
+  ungroup() %>% 
+  select(Patient, N, KMT2A_evidence,everything()) 
+  # unique()
+
+dim(kmt2a_rna.seq_fusions)
+# length(unique(kmt2a_rna.seq_fusions$Patient)) #2
+# View(kmt2a_rna.seq_fusions)
+
+# write.csv(kmt2a_rna.seq_fusions, "TARGET_AML_KMT2A-NUP98_Patients_RNA-seq_FusionCalls.csv", row.names = F)
+```
+
+
+
+
+#Session Info
+
+```{r}
+sessionInfo()
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

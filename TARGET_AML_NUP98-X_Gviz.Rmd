@@ -1,0 +1,594 @@
+---
+title: "Vizualization of del13q in NUP98-Rearranged AML"
+author: "Jenny Smith"
+date: "March 25, 2021"
+output: html_document
+---
+
+#Set-up 
+
+```{r setup}
+library(knitr)
+knitr::opts_knit$set(root.dir = file.path(TARGET,"Clinical/analysis/2020.03.25_NUP98-Rearranged_AML_Collaboration"))
+
+
+knitr::opts_chunk$set(tidy.opts=list(width.cutoff=50),tidy=TRUE, fig.align='center')
+options(stringsAsFactors = FALSE)
+table = function (..., useNA = 'ifany') base::table(..., useNA = useNA)
+```
+
+```{r message = FALSE, warning=FALSE}
+library(stringr)
+library(magrittr)
+library(ggplot2)
+library(gridExtra)
+library(tidyr)
+library(dplyr)
+library(tibble)
+library(RColorBrewer)
+
+library(GenomicFeatures)
+library(DeGSEA)
+
+getwd()
+```
+
+# Define Functions 
+
+```{r}
+get_locus <- function(in_band,type="start", cytobands){
+    df <- filter(cytobands, grepl(in_band, name))
+    
+    start <- pull(df,chromStart)
+    end <- pull(df, chromEnd)
+    
+    if(nrow(df) > 1){
+      start <- min(start)
+      end <- max(end)
+    }
+    
+    pos <- ifelse(type=="start", start, end)
+    return(pos)
+}
+
+
+
+make_GRlist <- function(GRanges_object){
+  n <- length(GRanges_object)
+  GRlist <- GRangesList()
+  for(i in 1:n){
+    GRlist[[i]] <- GRanges_object[i]
+  }
+  return(GRlist)
+}
+```
+
+
+# Read in the clinical Data
+
+```{r}
+NUP98.cohort <- read.csv("TARGET_AML_NUP98.rearranged_Cleaned_Groups_REG_10.26.2020.csv") %>% 
+  mutate(Reg.=as.character(Reg.)) %>% 
+  dplyr::select(-USI)
+
+
+dim(NUP98.cohort) #2304    4
+head(NUP98.cohort)
+```
+
+```{r}
+nup.ineligable <- openxlsx::read.xlsx("COG/nup98x_notincohort.xlsx") %>% 
+  filter(!Not_in == "") %>% 
+  arrange(Reg_NO)
+
+rna_cohort <- read.csv("TARGET_AML_RNAseq_Cohort_for_Manuscript.csv")
+table(rna_cohort$NUP98.Rearranged.Groups)
+# head(nup.ineligable, n=10)
+# dim(nup.ineligable) #69 patients
+# table(nup.ineligable$reason)
+```
+
+```{r}
+merged <- read.csv(file.path(CDE, "Merged/TARGET_AML_0531_1031_merged_CDEs_05.21.21.csv"),
+                    na.strings = c("N/A","#N/A","NA","^$", "^\\.$"))
+
+head(merged)
+# dim(merged) #2399  144
+```
+
+```{r}
+CDE_forAnalysis <- merged %>% 
+  filter(Eligibility_Comments != "remove") %>% 
+  filter(!Reg. %in% nup.ineligable$Reg_NO) %>%  #Arm D patients
+  mutate(Reg.=as.character(Reg.)) %>%
+  inner_join(., NUP98.cohort, 
+             by="Reg.") %>% 
+  
+  #For this analysis include <0.1 AR are FLT3-ITD positive 
+  mutate_at(vars(FLT3.ITD.positive.), ~gsub("<0.1", "Yes", .))
+  
+dim(CDE_forAnalysis) #2235  152
+```
+
+
+# Genomic References
+
+```{r}
+cytobands <- read.delim(file.path(PROJHOME, "0000.00.02_Reference_GeneInfo/cytoBand.txt"),
+                        header=F) %>% 
+  rename_all(~c("chrom",	"chromStart",	"chromEnd",	"name",	"gieStain")) %>% 
+  filter(chrom == "chr13")  %>% 
+  mutate(simpleBand=str_split_fixed(name,"\\.", n=2)[,1])
+
+head(cytobands)
+# View(cytobands)
+# dim(cytobands) #36 bands
+```
+
+```{r message=F}
+IDmap <- read.csv(file.path(PROJHOME,"0000.00.02_Reference_GeneInfo/GeneSymbol_Ensembl_ID_Conversion_GRCh37.69_FromBCCA.csv"))
+head(IDmap)
+
+
+GRCh37 <- AnnotationDbi::loadDb(file.path(PROJHOME, "0000.00.02_Reference_GeneInfo/SQL/GRCh37-lite_Ensembl_v69_TxDB.sqlite"))
+seqlevels(GRCh37) <-  c("13") #subset to chr13 only
+seqlevelsStyle(GRCh37) <- "UCSC"
+
+gene_ranges_GR <- genes(GRCh37)
+transripts_ranges_GR <- transcripts(GRCh37)
+seqlevels(gene_ranges_GR) 
+```
+
+```{r}
+transcriptIDmap <- read.csv(file.path(PROJHOME, "0000.00.02_Reference_GeneInfo/GRCh37_Ensembl_v69_TranscriptLevel_IDmap.csv"))
+
+
+dim(transcriptIDmap)
+head(transcriptIDmap)
+```
+
+
+
+# Chr13 Deletions by Karyotype 
+
+```{r}
+chr13 <- read.csv("Chr13_Deletions/TARGET_AML_chr13_abnormalities_by_Karyotype_Manuscript_Eligable_Pts.csv")
+
+dim(chr13)
+
+table(chr13$NUP98.Rearranged.Groups, chr13$Any_chr13_Abnormality)
+# table(chr13$NUP98.Rearranged.Groups)
+```
+
+```{r}
+chr13_hits <- filter(chr13, Any_chr13_Abnormality == "chr13_Abnormality") %>% 
+  mutate(USI=ifelse(USI == "Unknown", Reg., USI)) %>% 
+  
+  #Add in monosomies and trisomies
+  mutate(monosomy_13_band_start=ifelse(monosomy_trisomy_13=="monosomy13","p13", NA),
+         monosomy_13_band_end=ifelse(monosomy_trisomy_13=="monosomy13", "q34", NA)) %>% 
+  mutate(trisomy_13_band_start=ifelse(monosomy_trisomy_13=="trisomy13","p13", NA),
+         trisomy_13_band_end=ifelse(monosomy_trisomy_13=="trisomy13", "q34", NA)) %>% 
+  
+  rowwise() %>% 
+  mutate(monosomy_13_start=get_locus(in_band = monosomy_13_band_start,
+                                     type = "start", 
+                                     cytobands = cytobands),
+         monosomy_13_end=get_locus(in_band = monosomy_13_band_end,
+                                   type = "end", 
+                                   cytobands = cytobands)) %>%
+    mutate(trisomy_13_start=get_locus(in_band = trisomy_13_band_start,
+                                     type = "start", 
+                                     cytobands = cytobands),
+         trisomy_13_end=get_locus(in_band = trisomy_13_band_end,
+                                   type = "end", 
+                                   cytobands = cytobands)) %>% 
+  ungroup() %>% 
+  
+  mutate(itemRGB=case_when(
+    grepl("KDM5A", NUP98.Rearranged.Groups) ~ paste(col2rgb("magenta"), collapse=","),
+    grepl("X", NUP98.Rearranged.Groups) ~ paste(col2rgb("green1"), collapse=","),
+    grepl("NSD1", NUP98.Rearranged.Groups) ~ paste(col2rgb("cornflowerblue"), collapse=","),
+    grepl("Other",NUP98.Rearranged.Groups) ~ paste(col2rgb("grey"), collapse=",")))  %>%
+  arrange(NUP98.Rearranged.Groups) %>% 
+
+  dplyr::select(USI,NUP98.Rearranged.Groups, itemRGB,
+         deletion_13_start,deletion_13_end,
+         translocation_13_start, translocation_13_end,
+         monosomy_13_start, monosomy_13_end,
+         trisomy_13_start,trisomy_13_end) 
+  
+```
+
+
+
+# Create GRanges Objects
+
+```{r}
+del13_subset <- chr13_hits %>% 
+  filter(grepl("NUP98",NUP98.Rearranged.Groups)) %>% 
+  filter(!is.na(deletion_13_start))
+
+start <- pull(del13_subset, deletion_13_start)
+end <- pull(del13_subset, deletion_13_end)
+del13.gr <- GenomicRanges::GRanges(seqnames = S4Vectors::Rle("chr13"),
+                                   ranges = IRanges::IRanges(start=start,
+                                                             end=end,
+                                                             names = pull(del13_subset, USI)),
+                                   strand="*",
+                                   mcols=del13_subset)
+
+seqlevelsStyle(del13.gr)
+```
+
+  
+```{r}
+quantile(width(del13.gr)) %>% #59,500,001
+  format(digits=3, scientific=TRUE)
+```
+
+```{r}
+cytobands_gr <- GenomicRanges::GRanges(seqnames = S4Vectors::Rle("chr13"),
+                                   ranges = IRanges::IRanges(start=cytobands$chromStart,
+                                                             end=cytobands$chromEnd,
+                                                             names = pull(cytobands, name)),
+                                   strand="*",
+                                   mcols=cytobands)
+
+
+
+#Map the minimal region
+ord <- order(width(del13.gr)) #order so that the longest is at the end
+del13.list <- make_GRlist(GRanges_object=del13.gr[ord])
+intersection.coords <- Reduce(subsetByOverlaps, del13.list)
+# width(intersection.coords) #8,000,001
+
+#Map the cytobands that falls into minimal region
+cytobands_minimalRegion <- subsetByOverlaps(cytobands_gr, intersection.coords, minoverlap = 10)
+cytobands_minimalRegion
+
+seqlevelsStyle(intersection.coords)
+```
+
+
+# Find Minimally Deleted Segment
+
+```{r}
+genes_in_del13 <- subsetByOverlaps(gene_ranges_GR,intersection.coords)
+Symbols <- IDmap$geneSymbol[match(genes_in_del13$gene_id, IDmap$gene_id)]
+genes_in_del13$Symbol <- Symbols
+genes_in_del13 <- genes_in_del13[order(genes_in_del13)]
+
+length(unique(genes_in_del13$gene_id))
+length(unique(genes_in_del13$Symbol))
+# genes_in_del13["ENSG00000139687"] #match() worked
+# which(genes_in_del13$gene_id=="ENSG00000139687") #RB1 is at row 9
+# genes_in_del13
+
+
+tx_in_del13 <- subsetByOverlaps(transripts_ranges_GR,intersection.coords)
+Symbols <- transcriptIDmap$gene_name[match(tx_in_del13$tx_name, transcriptIDmap$transcript_id)]
+tx_in_del13$Symbol <- Symbols
+tx_in_del13 <- tx_in_del13[order(tx_in_del13)]
+
+# tx_in_del13[tx_in_del13$Symbol=="RB1"]
+# which(tx_in_del13$Symbol=="RB1") #15 16 17 18 19 20
+
+# tx_in_del13
+```
+
+```{r}
+all_genes_in_del13 <- subsetByOverlaps(gene_ranges_GR,del13.gr)
+# Symbols <- IDmap$geneSymbol[match(genes_in_del13$gene_id, IDmap$gene_id)]
+# genes_in_del13$Symbol <- Symbols
+# genes_in_del13 <- genes_in_del13[order(genes_in_del13)]
+```
+
+
+# Create Gene Model Dataframe
+
+```{r}
+chr13_geneModels <- select(GRCh37,keys=names(genes_in_del13),
+       columns=c("EXONCHROM","EXONSTART","EXONEND","EXONSTRAND" ,
+                 "EXONNAME","GENEID","TXNAME","TXTYPE"), 
+       keytype = "GENEID") %>% 
+  left_join(., IDmap, by=c("GENEID"="gene_id")) %>% 
+  dplyr::select(chromosome=EXONCHROM, 
+                start=EXONSTART,
+                end=EXONEND, 
+                strand=EXONSTRAND, 
+                gene=GENEID,
+                exon=EXONNAME,
+                transcript=TXNAME,
+                symbol=geneSymbol) %>% 
+  mutate(chromosome=paste0("chr", chromosome))
+
+chr13_geneModels
+# filter(chr13_geneModels, symbol=="RB1")
+# length(unique(chr13_geneModels$gene)) #125
+```
+
+```{r}
+chr13_Large_geneModels <- select(GRCh37,keys=names(all_genes_in_del13),
+       columns=c("EXONCHROM","EXONSTART","EXONEND","EXONSTRAND" ,
+                 "EXONNAME","GENEID","TXNAME","TXTYPE"), 
+       keytype = "GENEID") %>% 
+  left_join(., IDmap, by=c("GENEID"="gene_id")) %>% 
+  dplyr::select(chromosome=EXONCHROM, 
+                start=EXONSTART,
+                end=EXONEND, 
+                strand=EXONSTRAND, 
+                gene=GENEID,
+                exon=EXONNAME,
+                transcript=TXNAME,
+                symbol=geneSymbol) %>% 
+  mutate(chromosome=paste0("chr", chromosome))
+
+dim(chr13_Large_geneModels)
+```
+
+# Vizualize in Gviz 
+
+```{r}
+suppressPackageStartupMessages(library(Gviz))
+```
+
+Resources:
+https://support.bioconductor.org/p/133785/
+https://support.bioconductor.org/p/p133015/
+https://www.bioconductor.org/packages/release/bioc/vignettes/GenomicRanges/inst/doc/GenomicRangesIntroduction.html
+https://www.bioconductor.org/packages/release/bioc/vignettes/rtracklayer/inst/doc/rtracklayer.pdf
+https://davetang.org/muse/2013/10/03/using-gviz/ 
+
+
+```{r}
+## Which scheme is used?
+getOption("Gviz.scheme")
+
+## Change default settings for GeneRegionTrack
+scheme <- getScheme()
+scheme$GeneRegionTrack$fill <- "navy"
+scheme$GeneRegionTrack$col <- NULL
+# scheme$GeneRegionTrack$transcriptAnnotation <- "transcript"
+
+## replace default scheme with myScheme
+addScheme(scheme, "myScheme")
+options(Gviz.scheme="myScheme")
+getOption("Gviz.scheme")
+```
+
+## Minimally Deleted Region
+
+```{r fig.width=10, fig.height=4}
+
+chrom <- unique(chr13_geneModels$chromosome)
+genome <- "hg19"
+
+#genome reference tracks
+gtrack <- GenomeAxisTrack(littleTicks = TRUE, 
+                          fontsize=20)
+itrack <- IdeogramTrack(genome = genome, chromosome = chrom, 
+                        fontsize=30)
+
+options(ucscChromosomeNames=FALSE) #ensembldb.seqnameNotFound=NA
+s <- min(chr13_geneModels$start)
+e <- max(chr13_geneModels$end)
+
+
+min_region_track <- AnnotationTrack(intersection.coords, 
+                                    name="del13q", 
+                                    background.title = "navy",
+                                    fontsize=4)
+chr13_gene_track <- GeneRegionTrack(chr13_geneModels,
+                           genome = genome, 
+                           chromosome=chrom,
+                           transcriptAnnotation = "symbol",
+                           collapseTranscripts="longest",
+                           stacking="squish",
+                           name="Genes in Minimally Deleted Region",
+                           background.title = "navy", 
+                           cex.id=3.0,
+                           fontsize=12,
+                           fontcolor="black",
+                           showId=TRUE)
+
+ht <- HighlightTrack(trackList = list(min_region_track, chr13_gene_track),
+                     start=start(genes_in_del13[genes_in_del13$Symbol=="RB1"])-2.5e4,
+                     width=2.5e5,
+                     chromosome = chrom, 
+                     genome=genome,
+                     inBackground=TRUE)
+
+
+# pdf("TARGET_AML_NUP98_Minimal_Del13q_Gviz_Track.pdf", height = 5, width = 10)
+# pdf("Figures/Genome_Tracks/TARGET_AML_NUP98_Minimal_Del13q_Gviz_Track.svg", height = 5, width = 10)
+plotTracks(list(itrack, gtrack,ht))
+# dev.off()
+```
+
+```{r}
+#Okay works - but I cannot get it to show gene symbols. 
+# grTrack <- GeneRegionTrack(GRCh37, genome="hg19",
+#                            chromosome = unique(seqlevels(GRCh37)),
+#                            start = start(intersection.coords),
+#                            end = end(intersection.coords), 
+#                            collapseTranscripts=FALSE,
+#                            # symbol=genes_in_del13$Symbol,
+#                            showId=TRUE)
+
+```
+
+
+## All Deletions
+
+
+colors_del13 <- c("NUP98-KDM5A" = "magenta",
+                  "NUP98-KDM5A_del13q" = "mediumorchid3",
+                 "NUP98-NSD1" = "steelblue1",
+                 "NUP98-X" = "green1",
+                 "OtherAML" = "grey80",
+                 "OtherAML_del13q" = "darkslategray4",
+                 "NBM" = "gray50")
+
+```{r}
+table(chr13$deletion_13_band_start)
+cytobands_gr[grep("q12", names(cytobands_gr))]
+```
+
+```{r fig.width=20, fig.height=10}
+gtrack.2 <- GenomeAxisTrack(littleTicks = FALSE, fontsize=20)
+itrack.2 <- IdeogramTrack(genome = genome, chromosome = chrom, fontsize=30)
+
+del_track <- AnnotationTrack(del13.gr, 
+                              genome="hg19",
+                              stacking="squish",
+                              name="Del13q Regions in NUP98 Fusions",
+                              group=del13.gr$mcols.USI, 
+                              id=del13.gr$mcols.USI,
+                             cex.id=10.0, 
+                             fontsize=12, 
+                             background.title = "navy",
+                             fontcolor="black")
+feature(del_track) <- del13.gr$mcols.NUP98.Rearranged.Groups
+
+gene_track_large <- GeneRegionTrack(chr13_Large_geneModels,
+                           genome = genome,
+                           chromosome=chrom,
+                           transcriptAnnotation = "symbol",
+                           collapseTranscripts="longest",
+                           stacking="squish",
+                           name="Genes in Del13q Region",
+                           background.title = "navy",
+                           cex.id=0.6,
+                           fontsize=12,
+                           fontcolor="black",
+                           showId=TRUE)
+
+# pdf("TARGET_AML_NUP98_Full_Del13q_Gviz_Track.pdf", height = 12, width = 15)
+# gene_track_large
+# svg("Figures/Genome_Tracks/TARGET_AML_NUP98_Full_Del13q_Gviz_Track.svg", height = 12, width = 15)
+plotTracks(list(itrack.2, gtrack.2,del_track, gene_track_large),
+           groupAnnotation="group", 
+           `NUP98-KDM5A` = "magenta",
+           `NUP98-X` = "green1",
+           collapse=FALSE)
+
+# dev.off()
+```
+
+```{r}
+min(width(del13.gr))
+max(width(del13.gr)) #59,500,001
+
+del13.gr
+
+length(unique(chr13_Large_geneModels$gene))
+```
+
+
+
+
+# Example GVIZ 
+
+```{r}
+data("geneModels")
+data(cpgIslands)
+chr <- as.character(unique(seqnames(cpgIslands)))
+gen <- genome(cpgIslands)
+
+grtrack <- GeneRegionTrack(geneModels, 
+                           genome = gen, chromosome = chr, 
+                           name = "Gene Model",
+                           transcriptAnnotation = "symbol",
+                           background.title = "brown")
+plotTracks(grtrack)
+```
+
+```{r}
+## Which scheme is used?
+getOption("Gviz.scheme")
+
+## Change default settings for GeneRegionTrack
+scheme <- getScheme()
+scheme$GeneRegionTrack$fill <- "salmon"
+scheme$GeneRegionTrack$col <- NULL
+# scheme$GeneRegionTrack$transcriptAnnotation <- "transcript"
+
+## replace default scheme with myScheme
+addScheme(scheme, "myScheme")
+options(Gviz.scheme="myScheme")
+getOption("Gviz.scheme")
+
+data(geneModels)
+grtrack <- GeneRegionTrack(geneModels, genome="hg19", chromosome="chr7", name="Gene Model")
+plotTracks(grtrack)
+```
+
+```{r eval=FALSE}
+#Example
+library(TxDb.Hsapiens.UCSC.hg19.knownGene)
+txdb <- TxDb.Hsapiens.UCSC.hg19.knownGene
+
+# GeneRegionTrack(txdb)
+chr6_track <- GeneRegionTrack(txdb, chromosome="chr6", start=35000000, end=36000000,
+                              collapseTranscripts=FALSE,
+                              geneSymbol=TRUE, 
+                              showId=TRUE)
+plotTracks(chr6_track)
+```
+
+```{r eval=FALSE}
+#Example 
+library(rtracklayer)
+session <- browserSession()
+genome(session) <- "hg38"
+gr <- GRanges("chr11", IRanges(from, to))
+z <- getTable(ucscTableQuery(session, track = "uniprot", table = "unipDomain", range = gr))
+ z
+
+makeSplit <- function(d.f){
+    splitsville <- lapply(strsplit(z$chromStarts, ","), as.numeric)
+    splitsville2 <- lapply(strsplit(z$blockSizes, ","), as.numeric)
+    splitsville <- mapply(function(x,y) x + y, splitsville, d.f[,2])
+    splitsville2 <- mapply(function(x,y) x + y, splitsville2, splitsville)
+    len <- length(unlist(splitsville))
+    thatstuff <- rep("exon_1", len)
+    gr <- GRanges(rep(d.f[1,1], len),
+                  IRanges(unlist(splitsville), unlist(splitsville2)),
+                  rep(z$strand, sapply(splitsville, length)),
+                  feature = thatstuff, id = thatstuff, exon = thatstuff,
+                  transcript = rep(paste0("transcript_", seq_len(length(splitsville))),
+                                   sapply(splitsville, length)),
+                  gene = rep(z$name, sapply(splitsville, length)),
+                  symbol = rep(z$name, sapply(splitsville, length)),
+                  density = rep(1, length(thatstuff)))
+    gr
+}
+
+domains2 <- GeneRegionTrack(makeSplit(z))
+plotTracks(list(itrack, gtrack, knownGenes, domains2), transcriptAnnotation = "gene" )
+```
+
+
+
+
+#Session Info
+
+```{r}
+sessionInfo()
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
