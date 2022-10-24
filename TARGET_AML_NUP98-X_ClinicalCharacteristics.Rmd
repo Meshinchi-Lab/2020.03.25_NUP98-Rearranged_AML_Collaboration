@@ -9,13 +9,8 @@ output: html_document
 
 ```{r setup}
 library(knitr)
-clinical <- substr(CDE,1,nchar(CDE)-4)
-# dir.create(file.path(clinical,"analysis","2020.03.25_NUP98-Rearranged_AML_Collaboration"))
-
-# local <- Sys.info()[["nodename"]] == "C02FC5BLMD6M"
 local <- FALSE
-knitr::opts_knit$set(root.dir = ifelse(local, "~/NUP98/", file.path(clinical,"analysis","2020.03.25_NUP98-Rearranged_AML_Collaboration")))
-
+knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
 
 knitr::opts_chunk$set(tidy.opts=list(width.cutoff=50),tidy=TRUE, fig.align='center')
 options(stringsAsFactors = FALSE)
@@ -35,14 +30,32 @@ library(RColorBrewer)
 # getwd()
 ```
 
+
 ```{r}
-# source(file.path(SCRIPTS,"survival_analysis/Survplot_Functions_2018.10.24.r"))
+# Define File/Data Locations
+host <- Sys.info()[["nodename"]]
+if(grepl("gizmo", host)){
+  FASTDRIVE <- "/fh/fast/meshinchi_s"
+}else{
+  FASTDRIVE <- "/Users/jsmi26/fast_drive" #/fh/fast/meshinchi_s on the Fred Hutch HPC
+}
 
-if(!local){
-source(file.path(SCRIPTS,"RNAseq_Analysis/DifferentialExpn_PathwayAnalysis/R/Survplot_Functions_2018.10.24.r"))
-}  
+RPROJ <- list(PROJHOME=normalizePath(file.path(FASTDRIVE,"workingDir/TARGET/AML_TARGET/RNA/mRNAseq/analysis/")),
+              CDE=normalizePath(file.path(FASTDRIVE, "workingDir/TARGET/AML_TARGET/Clinical/CDE/")),
+              GENREFS=normalizePath(file.path(FASTDRIVE, "workingDir/TARGET/Reference_Data/")),
+              TARGET=normalizePath(file.path(FASTDRIVE, "workingDir/TARGET/AML_TARGET/")),
+              REFS=normalizePath(file.path(FASTDRIVE, "workingDir/0_For_Soheil/jlsmith3/reference_mapping-files/")),
+              HOME=normalizePath(file.path(FASTDRIVE,"workingDir/0_For_Soheil/jlsmith3/RNA_seq_Analysis/")),
+              SCRIPTS=normalizePath(file.path(FASTDRIVE,"workingDir/0_For_Soheil/jlsmith3/github_repos/")),
+              WORKINGDIR=normalizePath(file.path(FASTDRIVE,"workingDir/")))
 
+attach(RPROJ)
+rm(RPROJ)
+
+PROJHOME <- file.path(FASTDRIVE,"workingDir/TARGET/AML_TARGET/Clinical/analysis/2020.03.25_NUP98-Rearranged_AML_Collaboration")
 ```
+
+
 
 # Define Functions 
 
@@ -162,7 +175,7 @@ subset_summarize_breakpoints <- function(fusions_df, FOIs, filename="breakpoints
 # Read in the clinical Data
 
 ```{r}
-NUP98.cohort <- read.csv("TARGET_AML_NUP98.rearranged_Cleaned_Groups_REG_10.26.2020.csv") %>% 
+NUP98.cohort <- read.csv(file.path(PROJHOME,"TARGET_AML_NUP98.rearranged_Cleaned_Groups_REG_10.26.2020.csv")) %>% 
   mutate(Reg.=as.character(Reg.)) %>% 
   select(-USI)
 
@@ -175,7 +188,7 @@ dim(NUP98.cohort) #2304    4
 ```
 
 ```{r}
-nup.ineligable <- openxlsx::read.xlsx("COG/nup98x_notincohort.xlsx", sheet = 1) %>% 
+nup.ineligable <- openxlsx::read.xlsx(file.path(PROJHOME,"COG/nup98x_notincohort.xlsx"), sheet = 1) %>% 
   filter(!Not_in == "") %>% 
   arrange(Reg_NO)
 
@@ -197,7 +210,7 @@ dim(chr13)
 ```
 
 ```{r}
-exon_juncs <- read.csv("TARGET_AML_NUP98_fusion_exons_3.20.21.csv") %>% 
+exon_juncs <- read.csv(file.path(PROJHOME, "TARGET_AML_NUP98_fusion_exons_3.20.21.csv")) %>% 
   filter(!grepl("replicate", Sample))
 
 dim(exon_juncs)
@@ -205,9 +218,18 @@ dim(exon_juncs)
 ```
 
 ```{r}
-manifest <- read.csv("TARGET_AML_RNAseq_Cohort_for_Manuscript.csv")
+manifest <- read.csv(file.path(PROJHOME,"TARGET_AML_RNAseq_Cohort_for_Manuscript.csv"), row.names=1) 
 
 dim(manifest)
+
+
+# write.csv(select(manifest, Sample,USI, Protocol:Group,
+#                  NUP98.Rearranged.Groups,
+#                  Primary.Fusion,
+#                  Primary.CNV,
+#                  ISCN) %>% 
+#             mutate_at(vars(Primary.CNV), ~ifelse(.=="-Y", "'-Y'", .)),
+#           file.path(PROJHOME, "Eline_Bertrums_MS/NUP98_Manuscript_RNA-seq_Sample_Manifest.csv"), row.names = F)
 ```
 
 ```{r}
@@ -274,6 +296,9 @@ table(CDE_forAnalysis$NUP98.Rearranged.Groups)
 # table(CDE_forAnalysis$Any_chr13_Abnormality, CDE_forAnalysis$NUP98.Rearranged.Groups)
 ```
 
+```{r}
+table(CDE_forAnalysis$Protocol)
+```
 
 ```{r}
 forHematologics <- merged %>% 
@@ -334,6 +359,58 @@ WT1 updates in May 2021 - yes need to update
   NUP98-NSD1    61       0   47 *added 5 WT1 to NSD1 but not enough to make a difference*
   NUP98-X       15       0    5
   OtherAML    1802      81  192 *added 45 of WT1 to the ref cohort*
+
+
+## Define Sample Screening Differences
+
+```{r}
+CDE_forAnalysis %>% 
+  # These samples were included in the most broad RNA-seq based screening 
+  filter(!USI %in% manifest$USI) %>% 
+  dim()
+```
+
+```{r}
+CDE_forAnalysis %>% 
+  filter(!USI %in% manifest$USI) %>% 
+  select(USI, Protocol,Was.patient.in.NCI.TARGET.cohort, matches("Was.sample"),
+         ISCN) %>% 
+  mutate(has_karyotype=ifelse(ISCN=="Unknown","No", "Yes"), 
+         has_DNA_seq=ifelse(Was.sample.sent.for.WGS != "" | Was.sample.part.of.684.cohort != "", "Yes", "No")) %>% 
+  group_by(Protocol) %>% 
+  mutate(Total_Patients_in_Protocol=n()) %>% 
+  ungroup() %>% 
+  pivot_longer(cols=c(has_DNA_seq, has_karyotype),
+               names_to = "screen_type",
+               values_to = "present_absent") %>% 
+  group_by(Protocol,Total_Patients_in_Protocol, screen_type) %>% 
+  summarise(n_screened_samples=sum(present_absent=="Yes"))
+```
+
+```{r}
+# CDE_forAnalysis %>% 
+#   filter(!USI %in% manifest$USI) %>% 
+#   select(USI, Protocol,Primary.Fusion, Cyto_vs_Seq_Fusions) %>% 
+#   arrange(Cyto_vs_Seq_Fusions) %>% 
+#   filter(Protocol=="CCG-2961")
+```
+
+```{r}
+CDEs %>% 
+  filter(Protocol=="CCG-2961") %>% 
+  select(USI, matches("was.sample")) %>% 
+  arrange(desc(Was.sample.sent.for.RBD.sequencing)) %>% 
+  group_by(Was.sample.sent.for.RBD.sequencing,Was.sample.part.of.684.cohort, Was.sample.sent.for.WGS) %>% 
+  dplyr::count() %>% 
+  ungroup() %>% 
+  mutate(Total=sum(n),
+         Has_Genomic_Mut_data=ifelse(Was.sample.sent.for.RBD.sequencing == "Yes" | !Was.sample.part.of.684.cohort=="", "Yes", "No")) %>% 
+  group_by(Has_Genomic_Mut_data) %>%
+  summarize(Total_with_mut_data=sum(n)) %>%
+  ungroup() %>%
+  mutate(Percent=Total_with_mut_data/121*100)
+```
+
 
 
 # Define Samples for Oncoprint
@@ -1527,6 +1604,7 @@ all_KDM5A <- merged %>%
 chr13.abn.matrix <- CDE_forAnalysis %>% 
   filter(grepl("NUP98-KDM5A|Other", NUP98.Rearranged.Groups),
          !grepl("Unknown", Any_chr13_Abnormality)) %>% 
+  select(NUP98.Rearranged.Groups,Any_chr13_Abnormality) %>% 
   group_by(NUP98.Rearranged.Groups,Any_chr13_Abnormality) %>% 
   count() %>% 
   ungroup() %>% 
@@ -1541,8 +1619,55 @@ addmargins(chr13.abn.matrix)
 fisher.test(chr13.abn.matrix, alternative = c("greater"))
 ```
 
+```{r}
+chr13.FAB.matrix <- CDE_forAnalysis %>% 
+  filter(grepl("NUP98-KDM5A|Other", NUP98.Rearranged.Groups),
+         !grepl("Unknown", Any_chr13_Abnormality)) %>% 
+  filter(M7_AML=="Yes") %>% 
+  select(NUP98.Rearranged.Groups,Any_chr13_Abnormality) %>% 
+  mutate(NUP98.Rearranged.Groups=factor(NUP98.Rearranged.Groups,
+                                        levels=unique(NUP98.Rearranged.Groups)),
+         Any_chr13_Abnormality=factor(Any_chr13_Abnormality, 
+                                      levels = unique(Any_chr13_Abnormality))) %>% 
+  group_by(NUP98.Rearranged.Groups,Any_chr13_Abnormality, .drop=FALSE) %>%
+  count() %>%
+  ungroup() %>%
+  pivot_wider(names_from=Any_chr13_Abnormality,
+              values_from=n) %>%
+  column_to_rownames("NUP98.Rearranged.Groups") %>%
+  as.matrix()
+
+chr13.FAB.matrix
+# addmargins(chr13.FAB.matrix)
+
+fisher.test(chr13.FAB.matrix, alternative = c("greater"))
+```
+
+
+```{r}
+exon13vs13abn <- CDE_forAnalysis %>% 
+  filter(NUP98.Rearranged.Groups!="OtherAML") %>% 
+  filter(!grepl("Unknown", Any_chr13_Abnormality), 
+         !is.na(NUP98_Exons)) %>% 
+  select(Sample, NUP98_Exons, matches("chr13")) %>% 
+  arrange(NUP98_Exons) %>% 
+  mutate(NUP98_Exons=ifelse(NUP98_Exons=="Exon13", NUP98_Exons, "OtherExons")) %>% 
+  group_by(Any_chr13_Abnormality, NUP98_Exons) %>% 
+  dplyr::count() %>% 
+  ungroup() %>% 
+  pivot_wider(names_from = NUP98_Exons, 
+              values_from=n) %>% 
+  column_to_rownames("Any_chr13_Abnormality") %>% 
+  as.matrix()
+
+exon13vs13abn
+
+test_res <- fisher.test(exon13vs13abn, alternative = c("greater"))
+round(test_res$p.value, digits = 3)
+```
+
 ### KM plots
-å
+
 ```{r}
 df <- CDE_forAnalysis %>% 
   select(Reg., NUP98.Rearranged.Groups, Any_chr13_Deletion, M7_AML, matches("_13|chr13|OS|EFS|Event")) %>% 
@@ -1608,8 +1733,6 @@ grid.arrange(grobs=c(chr13_KM$OS, chr13_KM$EFS), ncol=2)
 # dev.off()
 ```
 
-
-
 ```{r fig.height=12, fig.width=20}
 cc_B <- brewer.pal(7, "Set1") %>% 
   set_names(unique(df$NUP98.KDM5A_chr13_AMKL))
@@ -1638,8 +1761,6 @@ grid.arrange(grobs=c(chr13_AMKL_KM$OS, chr13_AMKL_KM$EFS), ncol=2)
 # pdf("TARGET_AML_OtherAML_del13q_AMKL_KMplot.pdf", height = 12, width = 20)
 grid.arrange(grobs=c(chr13_AMKL$OS, chr13_AMKL$EFS), ncol=2)
 # dev.off()
-
-
 # grid.arrange(grobs=c( chr13_AMKL$OS, chr13_AMKL$EFS))
 ```
 
